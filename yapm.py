@@ -376,21 +376,33 @@ def load_index() -> Dict:
     with open(INDEX_FILE) as f:
         return json.load(f)
 
-def fetch_package(pkg: str) -> Optional[bytes]:
+def fetch_package(pkg: str, mirror_url: Optional[str] = None) -> Optional[bytes]:
     idx = load_index()
     pkg_info = idx.get("packages", {}).get(pkg)
 
-    def _try_yapm_urls(mirror_url: str, version: str = "") -> Optional[bytes]:
+    def _try_yapm_urls(m_url: str, version: str = "") -> Optional[bytes]:
         """Try bare name then versioned name for YAPM packages."""
         candidates = [f"{pkg}.yapm"]
         if version and version != "0.0.0":
             candidates.append(f"{pkg}-{version}.yapm")
         for candidate in candidates:
-            url = normalize(mirror_url) + candidate
+            url = normalize(m_url) + candidate
             data = download(url, desc=f"Downloading {pkg}")
             if data and is_valid_zip(data):
                 return data
         return None
+
+    # If a specific mirror was requested, only try that one
+    if mirror_url:
+        version = pkg_info.get("version", "") if pkg_info else ""
+        fmt = pkg_info.get("format", "yapm") if pkg_info else "yapm"
+        if fmt in ["deb", "arch"]:
+            download_path = pkg_info.get("download_path", "") if pkg_info else ""
+            if download_path:
+                url = normalize(mirror_url) + download_path
+                return download(url, desc=f"Downloading {pkg}")
+            return None
+        return _try_yapm_urls(mirror_url, version)
 
     if pkg_info and "mirror" in pkg_info:
         if pkg_info.get("format") in ["deb", "arch"]:
@@ -539,10 +551,23 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
     save_db(db)
 
-def install_package(pkg: str, fmt: str):
+def install_package(pkg: str, fmt: str, mirror_index: Optional[int] = None):
     db = load_db()
     idx = load_index()
     pkg_name = pkg
+
+    # Resolve pinned mirror URL if -m was given
+    pinned_mirror: Optional[str] = None
+    if mirror_index is not None:
+        mirrors = sorted_mirrors()
+        if mirror_index < 1 or mirror_index > len(mirrors):
+            print(f"Error: mirror index {mirror_index} is out of range.")
+            print("Available mirrors (use 'yapm mirror list' to see them):")
+            for i, m in enumerate(mirrors, 1):
+                print(f"  [{i}] {m['url']} (priority {m['priority']})")
+            sys.exit(1)
+        pinned_mirror = mirrors[mirror_index - 1]["url"]
+        print(f"Pinned to mirror [{mirror_index}]: {pinned_mirror}")
     
     pkg_path = Path(pkg)
     if pkg_path.is_file():
@@ -580,7 +605,7 @@ def install_package(pkg: str, fmt: str):
     
     for p in to_install:
         print(f"Installing {p}...")
-        data = fetch_package(p)
+        data = fetch_package(p, mirror_url=pinned_mirror)
         if not data:
             print(f"Failed to fetch {p}. Aborting.")
             sys.exit(1)
@@ -771,6 +796,9 @@ def main():
     )
     p_install.add_argument("package", metavar="PACKAGE",
                            help="Package name (looked up in index) or path to a local package file")
+    p_install.add_argument("-m", "--mirror", type=int, default=None, metavar="N",
+                           help="Pin install to a specific mirror by its index number from "
+                                "'yapm mirror list' (e.g. -m 5 for mirror #5)")
 
     # remove
     p_remove = sub.add_parser(
@@ -914,7 +942,7 @@ def main():
     ensure_dirs()
 
     if args.command == "install":
-        install_package(args.package, args.format)
+        install_package(args.package, args.format, mirror_index=args.mirror)
     elif args.command == "remove":
         remove_package(args.package)
     elif args.command == "list":
