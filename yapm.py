@@ -155,6 +155,10 @@ def download(url: str, desc: str = "Downloading") -> Optional[bytes]:
         print(f"\nError downloading {url}: {e}")
         return None
 
+def is_valid_zip(data: bytes) -> bool:
+    """Check ZIP magic bytes (PK\x03\x04) to avoid treating HTML 404 pages as packages."""
+    return len(data) > 3 and data[:2] == b'PK'
+
 def safe_extract(zip_path: Path, target: Path):
     with zipfile.ZipFile(zip_path) as z:
         for member in z.infolist():
@@ -400,7 +404,7 @@ def fetch_package(pkg: str) -> Optional[bytes]:
         for candidate in candidates:
             url = normalize(mirror_url) + candidate
             data = download(url, desc=f"Downloading {pkg}")
-            if data:
+            if data and is_valid_zip(data):
                 return data
         return None
 
