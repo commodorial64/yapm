@@ -7,9 +7,17 @@ set -e
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-NC='\033[0m' # No Color
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
 echo "Installing yapm..."
+
+# Must run as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Error: install.sh must be run with sudo.${NC}"
+    echo "  Try: sudo ./install.sh"
+    exit 1
+fi
 
 # Check dependencies
 if ! command -v python3 &> /dev/null; then
@@ -17,13 +25,7 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# Paths
-if [ "$EUID" -eq 0 ]; then
-    INSTALL_BIN="/usr/local/bin/yapm"
-    echo "Running as root, installing globally to $INSTALL_BIN"
-else
-    INSTALL_BIN="$HOME/.local/bin/yapm"
-fi
+INSTALL_BIN="/usr/local/bin/yapm"
 SRC_FILE="$(dirname "$0")/yapm.py"
 
 if [ ! -f "$SRC_FILE" ]; then
@@ -31,12 +33,10 @@ if [ ! -f "$SRC_FILE" ]; then
     exit 1
 fi
 
-# Create dirs
-if [ "$EUID" -ne 0 ]; then
-    mkdir -p "$HOME/.local/bin"
-fi
-mkdir -p "$HOME/.config/yapm"
-mkdir -p "$HOME/.local/share/yapm/packages"
+# Create system data dirs
+mkdir -p /etc/yapm
+mkdir -p /var/lib/yapm/packages
+mkdir -p /var/lib/yapm/cache
 
 # Copy and make executable
 cp "$SRC_FILE" "$INSTALL_BIN"
@@ -47,16 +47,9 @@ echo -e "${GREEN}Successfully installed yapm to $INSTALL_BIN${NC}"
 # Shadow check
 CURRENT_YAPM=$(which yapm 2>/dev/null || echo "")
 if [ -n "$CURRENT_YAPM" ] && [ "$CURRENT_YAPM" != "$INSTALL_BIN" ]; then
-    echo -e "\n${RED}Warning: yapm is shadowed by $CURRENT_YAPM${NC}"
-    echo "The version at $CURRENT_YAPM will be run instead of the new one."
+    echo -e "\n${YELLOW}Warning: another yapm was found at $CURRENT_YAPM${NC}"
+    echo "It may shadow the newly installed version."
     echo "You might want to remove it: sudo rm $CURRENT_YAPM"
 fi
 
-# PATH check
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo -e "\n${RED}Warning: $HOME/.local/bin is not in your PATH.${NC}"
-    echo "Add this to your .bashrc or .zshrc:"
-    echo 'export PATH="$HOME/.local/bin:$PATH"'
-fi
-
-echo -e "\nRun 'yapm version' to verify installation."
+echo -e "\nRun 'sudo yapm version' to verify installation."
