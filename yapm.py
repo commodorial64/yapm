@@ -19,7 +19,7 @@ from typing import List, Dict, Optional
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.2-alpha"
+APP_VERSION = "0.2.1-alpha"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
@@ -695,7 +695,7 @@ def uninstall_yapm():
 
 YAPM_SOURCE_URL = "https://raw.githubusercontent.com/galaxyg144/yapm/main/yapm.py"
 
-def self_upgrade_yapm(force: bool = False):
+def update_yapm(force: bool = False):
     import re
     print(f"Fetching latest yapm from {YAPM_SOURCE_URL} ...")
     data = download(YAPM_SOURCE_URL, desc="Downloading yapm")
@@ -895,7 +895,6 @@ def main():
                     "and native YAPM (index.json) mirror formats.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
     # upgrade
     sub.add_parser(
         "upgrade",
@@ -904,6 +903,14 @@ def main():
                     "re-download any packages where a newer version is available.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # fetch
+    sub.add_parser(
+        "fetch",
+        help="update yapm itself.",
+        description="Download and install the latest version of yapm from the github repo.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+        
 
     # version
     sub.add_parser(
@@ -1026,8 +1033,8 @@ def main():
         print(f"config version {ver}")
     elif args.command == "uninstall":
         uninstall_yapm()
-    elif args.command == "self-upgrade":
-        self_upgrade_yapm(force=args.force)
+    elif args.command == "fetch":
+        update_yapm(force=args.force)
     elif args.command == "mirror":
         if args.mirror_cmd == "add":
             mirror_add(args.url, args.priority)
