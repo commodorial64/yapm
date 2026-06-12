@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import urllib.request
+import urllib.error
 import zipfile
 import subprocess
 import gzip
@@ -86,7 +87,20 @@ def save_config(config: Dict):
 
 def load_db() -> Dict:
     with open(DB_FILE) as f:
-        return json.load(f)
+        db = json.load(f)
+    migrated = False
+    new_db = {}
+    for k, v in db.items():
+        if "/" in k:
+            author, name = k.split("/", 1)
+            v.setdefault("metadata", {})["author"] = author
+            new_db[name] = v
+            migrated = True
+        else:
+            new_db[k] = v
+    if migrated:
+        save_db(new_db)
+    return new_db
 
 def save_db(db: Dict):
     with open(DB_FILE, "w") as f:
@@ -124,7 +138,7 @@ def validate_mirror(url: str) -> bool:
     except Exception:
         return False
 
-def download(url: str, desc: str = "Downloading") -> Optional[bytes]:
+def download(url: str, desc: str = "Downloading", silent_errors: bool = False) -> Optional[bytes]:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'yapm/1.0'})
         with urllib.request.urlopen(req, timeout=10) as response:
@@ -146,24 +160,80 @@ def download(url: str, desc: str = "Downloading") -> Optional[bytes]:
                     print(f"\r{desc}: [{bar}] {percent}% ({downloaded}/{size} bytes)", end="", flush=True)
             print()
             return data
+    except urllib.error.HTTPError as e:
+        if not silent_errors or e.code != 404:
+            print(f"\nError downloading {url}: {e}")
+        return None
     except Exception as e:
-        print(f"\nError downloading {url}: {e}")
+        if not silent_errors:
+            print(f"\nError downloading {url}: {e}")
         return None
 
 def is_valid_zip(data: bytes) -> bool:
-    """Check ZIP magic bytes (PK\x03\x04) to avoid treating HTML 404 pages as packages."""
-    return len(data) > 3 and data[:2] == b'PK'
+    """Check ZIP magic bytes (PK\x03\x04) or ZSTD magic bytes (28 B5 2F FD) to avoid treating HTML 404 pages as packages."""
+    if len(data) > 3 and data[:2] == b'PK':
+        return True
+    if len(data) > 3 and data[:4] == b'\x28\xb5\x2f\xfd':
+        return True
+    return False
 
-def safe_extract(zip_path: Path, target: Path):
-    with zipfile.ZipFile(zip_path) as z:
-        for member in z.infolist():
-            member_path = (target / member.filename).resolve()
-            if not str(member_path).startswith(str(target.resolve())):
-                raise Exception("Unsafe zip detected")
-            z.extract(member, target)
-            attr = member.external_attr >> 16
-            if attr != 0:
-                os.chmod(member_path, attr)
+def safe_extract(archive_path: Path, target: Path):
+    with open(archive_path, "rb") as f:
+        magic = f.read(4)
+        
+    if magic[:2] == b'PK':
+        with zipfile.ZipFile(archive_path) as z:
+            for member in z.infolist():
+                member_path = (target / member.filename).resolve()
+                if not str(member_path).startswith(str(target.resolve())):
+                    raise Exception("Unsafe zip detected")
+                z.extract(member, target)
+                attr = member.external_attr >> 16
+                if attr != 0:
+                    os.chmod(member_path, attr)
+    elif magic == b'\x28\xb5\x2f\xfd':
+        with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+            subprocess.run(["zstd", "-d", "-f", str(archive_path), "-o", tmp.name], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with tarfile.open(tmp.name) as tar:
+                for member in tar.getmembers():
+                    member_path = (target / member.name).resolve()
+                    if not str(member_path).startswith(str(target.resolve())):
+                        raise Exception("Unsafe tar detected")
+                    tar.extract(member, target)
+    else:
+        raise Exception("Unknown archive format")
+
+def parse_pkginfo(data: bytes) -> dict:
+    result: dict = {"depends": []}
+    with tempfile.TemporaryDirectory() as td:
+        archive_path = Path(td) / "pkg.tar.zst"
+        archive_path.write_bytes(data)
+        
+        tar_path = Path(td) / "pkg.tar"
+        try:
+            subprocess.run(["zstd", "-d", "-f", str(archive_path), "-o", str(tar_path)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with tarfile.open(tar_path) as tar:
+                try:
+                    f = tar.extractfile(".PKGINFO")
+                    if f:
+                        content = f.read().decode('utf-8')
+                        for line in content.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+                            if '=' in line:
+                                k, v = line.split('=', 1)
+                                k = k.strip()
+                                v = v.strip()
+                                if k == "depend":
+                                    result["depends"].append(v)
+                                else:
+                                    result[k] = v
+                except KeyError:
+                    pass
+        except Exception:
+            pass
+    return result
 
 def parse_yapm_data(content: str) -> dict:
     data = {"METADATA": {}, "CONTENT": {}, "FILES": {}}
@@ -349,41 +419,12 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
         print(f"Error parsing Arch index: {e}")
 
 def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None) -> Optional[dict]:
-    """Look up a specific version of a package, handling both old and new index formats.
-    Supports author@name syntax and unqualified name disambiguation."""
+    """Look up a specific version of a package."""
     packages = idx.get("packages", {})
-    entry = None
-    key = pkg
+    entry = packages.get(pkg)
 
-    if "@" in pkg:
-        author, name = pkg.split("@", 1)
-        key = f"{author}/{name}"
-        entry = packages.get(key)
-        if not entry:
-            return None
-    else:
-        entry = packages.get(key)
-        if not entry:
-            matches = [k for k in packages if k.endswith(f"/{pkg}")]
-            if len(matches) == 0:
-                return None
-            elif len(matches) > 1:
-                print(f"Multiple packages named '{pkg}'. Which author?")
-                for i, m in enumerate(matches, 1):
-                    print(f"  [{i}] {format_key(m)}")
-                try:
-                    choice = int(input("> ").strip())
-                    if choice < 1 or choice > len(matches):
-                        print("Invalid choice.")
-                        sys.exit(1)
-                    key = matches[choice - 1]
-                except (ValueError, EOFError):
-                    print("Invalid input.")
-                    sys.exit(1)
-                entry = packages[key]
-            else:
-                key = matches[0]
-                entry = packages[key]
+    if not entry:
+        return None
 
     if "versions" in entry:
         ver = version or entry.get("latest", "0.0.0")
@@ -395,7 +436,7 @@ def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None) -> Optional
         result["mirror"] = entry.get("mirror", "")
         result["format"] = entry.get("format", "yapm")
         result["latest"] = entry.get("latest", ver)
-        result["_key"] = key
+        result["_key"] = pkg
         return result
     return dict(entry)
 
@@ -420,6 +461,9 @@ def update_index():
                         pkgs = new_pkgs
 
                     for pkg_name, pkg_info in pkgs.items():
+                        if "/" in pkg_name:
+                            pkg_name = pkg_name.split("/", 1)[-1]
+                            
                         if pkg_name in merged_index["packages"]:
                             continue
                         if "versions" in pkg_info:
@@ -445,7 +489,32 @@ def load_index() -> Dict:
         print("Warning: Local index not found. Run 'yapm update' first.")
         return {"packages": {}}
     with open(INDEX_FILE) as f:
-        return json.load(f)
+        idx = json.load(f)
+    new_pkgs = {}
+    for k, v in idx.get("packages", {}).items():
+        name = k.split("/", 1)[-1] if "/" in k else k
+        if name not in new_pkgs:
+            new_pkgs[name] = v
+    idx["packages"] = new_pkgs
+    return idx
+
+def fetch_from_github(pkg_name: str, repo: str, version: Optional[str]) -> Optional[bytes]:
+    branches = ["main", "master"]
+    dirs = ["", "packages/"]
+    
+    candidates = []
+    if version and version != "0.0.0":
+        candidates.append(f"{pkg_name}-{version}.yapm")
+    candidates.append(f"{pkg_name}.yapm")
+    
+    for branch in branches:
+        for d in dirs:
+            for cand in candidates:
+                url = f"https://raw.githubusercontent.com/{repo}/{branch}/{d}{cand}"
+                data = download(url, desc=f"Downloading {pkg_name} from GitHub", silent_errors=True)
+                if data and is_valid_zip(data):
+                    return data
+    return None
 
 def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None) -> Optional[bytes]:
     idx = load_index()
@@ -620,22 +689,44 @@ def install_package(pkg: str, fmt: str, mirror_index: Optional[int] = None):
     db = load_db()
     idx = load_index()
 
-    # Parse author@name=version
+    # Parse package@source=version
     pkg_spec = pkg
     pkg_version = None
     if "=" in pkg_spec:
         pkg_spec, pkg_version = pkg_spec.split("=", 1)
 
-    pkg_author = None
+    pkg_source = None
     if "@" in pkg_spec:
-        pkg_author, pkg_name = pkg_spec.split("@", 1)
+        pkg_name, pkg_source = pkg_spec.rsplit("@", 1)
     else:
         pkg_name = pkg_spec
 
-    pkg_key = f"{pkg_author}/{pkg_name}" if pkg_author else pkg_name
+    pinned_mirror = None
+    is_github = False
+    github_repo = None
+    
+    if pkg_source:
+        if pkg_source.startswith("github:"):
+            is_github = True
+            github_repo = pkg_source[7:]
+        else:
+            mirrors = sorted_mirrors()
+            matched_mirror = None
+            for m in mirrors:
+                if pkg_source == m["url"]:
+                    matched_mirror = m["url"]
+                    break
+            if not matched_mirror:
+                for m in mirrors:
+                    if pkg_source in m["url"]:
+                        matched_mirror = m["url"]
+                        break
+            if matched_mirror:
+                pinned_mirror = matched_mirror
+            else:
+                print(f"Error: Unknown source '{pkg_source}' — not a configured mirror and not a github:User/Repo reference")
+                sys.exit(1)
 
-    # Resolve pinned mirror URL if -m was given
-    pinned_mirror: Optional[str] = None
     if mirror_index is not None:
         mirrors = sorted_mirrors()
         if mirror_index < 1 or mirror_index > len(mirrors):
@@ -664,51 +755,86 @@ def install_package(pkg: str, fmt: str, mirror_index: Optional[int] = None):
         with open(pkg_path, "rb") as f:
             data = f.read()
         _install_single(pkg_name, db, data, fmt)
+        
+        if fmt == "arch":
+            pkginfo = parse_pkginfo(data)
+            if pkginfo:
+                db[pkg_name]["version"] = pkginfo.get("pkgver", "0.0.0")
+                db[pkg_name]["dependencies"] = pkginfo.get("depends", [])
+                db[pkg_name].setdefault("metadata", {})["description"] = pkginfo.get("pkgdesc", "")
+                save_db(db)
+                
         print(f"Installed {pkg_name} successfully.")
         return
 
+    pre_fetched_data = {}
+    if is_github and github_repo:
+        print(f"Fetching {pkg_name} from GitHub ({github_repo})...")
+        data = fetch_from_github(pkg_name, github_repo, pkg_version)
+        if not data:
+            print(f"Failed to fetch {pkg_name} from GitHub. Aborting.")
+            sys.exit(1)
+        
+        pre_fetched_data[pkg_name] = data
+        
+        meta = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for member in z.infolist():
+                    if member.filename.endswith("yapm.data"):
+                        content = z.read(member.filename).decode('utf-8')
+                        y_data = parse_yapm_data(content)
+                        meta = y_data.get("METADATA", {})
+                        break
+        except Exception:
+            pass
+            
+        idx.setdefault("packages", {})[pkg_name] = {
+            "version": meta.get("version", "0.0.0"),
+            "dependencies": meta.get("dependencies", []),
+            "format": "yapm"
+        }
+
     # Remote installations
-    if pkg_key in db:
+    if pkg_name in db:
         ver_text = f" ({pkg_version})" if pkg_version else ""
-        display = format_key(pkg_key)
-        print(f"{display} is already installed.{ver_text}")
+        print(f"{pkg_name} is already installed.{ver_text}")
         return
 
     to_install = []
-    resolve_dependencies(pkg_key, idx, db, to_install, set(), version=pkg_version)
+    resolve_dependencies(pkg_name, idx, db, to_install, set(), version=pkg_version)
 
     if not to_install:
         print("Nothing to install.")
         return
 
     ver_text = f" (pinning v{pkg_version})" if pkg_version else ""
-    display = format_key(pkg_key)
     print(f"The following packages will be installed:{ver_text}")
     for p in to_install:
-        p_ver = pkg_version if p == pkg_key else None
-        display_p = format_key(p) if "/" in p else p
-        print(f"Installing {display_p}...")
-        data = fetch_package(p, mirror_url=pinned_mirror, version=p_ver)
+        p_ver = pkg_version if p == pkg_name else None
+        print(f"Installing {p}...")
+        
+        if p in pre_fetched_data:
+            data = pre_fetched_data[p]
+        else:
+            data = fetch_package(p, mirror_url=pinned_mirror, version=p_ver)
+            
         if not data:
-            print(f"Failed to fetch {display_p}. Aborting.")
+            print(f"Failed to fetch {p}. Aborting.")
             sys.exit(1)
 
         pkg_info = get_pkg_info(idx, p, p_ver)
         fetched_fmt = (pkg_info or {}).get("format", "yapm")
         _install_single(p, db, data, fetched_fmt)
-        print(f"Installed {display_p}.")
+        print(f"Installed {p}.")
 
 def remove_package(pkg: str):
     db = load_db()
 
-    # Parse author@name
     pkg_key = pkg
-    if "@" in pkg:
-        author, name = pkg.split("@", 1)
-        pkg_key = f"{author}/{name}"
 
     if pkg_key not in db:
-        print(f"Package '{format_key(pkg_key)}' not installed.")
+        print(f"Package '{pkg_key}' not installed.")
         return
 
     target = Path(db[pkg_key]["path"])
@@ -835,18 +961,9 @@ def info_package(pkg: str):
     idx = load_index()
     db = load_db()
 
-    # Parse author@name to find the key
     pkg_key = pkg
-    if "@" in pkg:
-        author, name = pkg.split("@", 1)
-        pkg_key = f"{author}/{name}"
-    else:
-        matches = [k for k in idx.get("packages", {}) if k.endswith(f"/{pkg}")] or [k for k in db if k.endswith(f"/{pkg}")]
-        if len(matches) == 1:
-            pkg_key = matches[0]
 
-    display = format_key(pkg_key) if "/" in pkg_key else pkg_key
-    print(f"Package: {display}")
+    print(f"Package: {pkg_key}")
 
     if pkg_key in db:
         print(f"Status: Installed (v{db[pkg_key].get('version', '0.0.0')}) [Format: {db[pkg_key].get('format', 'yapm').upper()}]")
@@ -879,7 +996,7 @@ def search_package(term: str):
     term_lower = term.lower()
 
     for pkg_key, pkg_info in idx.get("packages", {}).items():
-        display = format_key(pkg_key)
+        display = pkg_key
         display_lower = display.lower()
 
         if "versions" in pkg_info:
@@ -918,12 +1035,15 @@ def build_package(directory: str):
     out_file = f"{name}-{version}.yapm"
     print(f"Building {out_file} from {directory}...")
     
-    with zipfile.ZipFile(out_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(source_dir):
-            for file in files:
-                file_path = Path(root) / file
-                arcname = file_path.relative_to(source_dir)
-                zf.write(file_path, arcname)
+    with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+        with tarfile.open(tmp.name, 'w') as tar:
+            for root, dirs, files in os.walk(source_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    arcname = file_path.relative_to(source_dir)
+                    tar.add(file_path, arcname=arcname)
+                    
+        subprocess.run(["zstd", "-f", "-19", tmp.name, "-o", out_file], check=True, stdout=subprocess.DEVNULL)
                 
     print(f"Success! Package built: {out_file}")
 
