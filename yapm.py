@@ -16,6 +16,8 @@ import io
 from pathlib import Path
 from typing import List, Dict, Optional
 
+VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
+
 # ============================================================
 # CONFIGURATION PATHS
 # ============================================================
@@ -34,6 +36,32 @@ DB_FILE     = DATA_DIR / "installed.json"
 CACHE_DIR   = DATA_DIR / "cache"
 INDEX_FILE  = CACHE_DIR / "index.json"
 BIN_DIR     = Path("/usr/local/bin")
+ROOT_DIR    = Path("/")
+
+def set_root_dir(root_str: str):
+    global ROOT_DIR, INSTALL_DIR, DB_FILE, BIN_DIR
+    ROOT_DIR = Path(root_str).resolve()
+    if str(ROOT_DIR) == "/":
+        return
+    INSTALL_DIR = ROOT_DIR / "var/lib/yapm/packages"
+    DB_FILE = ROOT_DIR / "var/lib/yapm/installed.json"
+    BIN_DIR = ROOT_DIR / "usr/local/bin"
+
+YAPM_CONF_SYSTEM = Path("/etc/yapm/yapm.conf")
+YAPM_CONF_USER   = Path.home() / ".config" / "yapm" / "yapm.conf"
+
+KNOWN_FLAGS = {
+    "yapm.riot": False,
+    "yapm.insroot": False,
+    "yapm.hooks": False,
+    "yapm.noconfirm": False,
+    "yapm.verbose": False,
+    "yapm.autoupdate": False,
+    "yapm.paranoid": False,
+    "yapm.dangerzone": False,
+    "yapm.nativenationality": False,
+    "yapm.yapm": False,
+}
 
 DEFAULT_CONFIG = {
     "version": CURRENT_VERSION,
@@ -62,6 +90,8 @@ def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG)
@@ -84,6 +114,33 @@ def load_config() -> Dict:
 def save_config(config: Dict):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
+
+def load_yapm_conf() -> Dict[str, str]:
+    result = {}
+    for path in [YAPM_CONF_SYSTEM, YAPM_CONF_USER]:
+        if path.exists():
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        result[k.strip()] = v.strip()
+    return result
+
+def save_yapm_conf(overrides: Dict[str, str]):
+    YAPM_CONF_USER.parent.mkdir(parents=True, exist_ok=True)
+    with open(YAPM_CONF_USER, "w") as f:
+        f.write("# YAPM Configuration\n")
+        for k in KNOWN_FLAGS:
+            v = overrides.get(k, str(KNOWN_FLAGS[k]).lower())
+            f.write(f"{k} = {v}\n")
+
+def config_flag(name: str) -> bool:
+    conf = load_yapm_conf()
+    val = conf.get(name, str(KNOWN_FLAGS.get(name, "false")))
+    return val.lower() == "true"
 
 def load_db() -> Dict:
     with open(DB_FILE) as f:
@@ -178,6 +235,15 @@ def is_valid_zip(data: bytes) -> bool:
     return False
 
 def safe_extract(archive_path: Path, target: Path):
+    if config_flag("yapm.dangerzone"):
+        print("DANGERZONE: safety checks disabled. You asked for this.")
+        if archive_path.name.endswith(".zst") or archive_path.name.endswith(".tar.zst"):
+            subprocess.run(["tar", "--use-compress-program=zstd", "-xf", str(archive_path), "-C", str(target)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            with zipfile.ZipFile(archive_path) as z:
+                z.extractall(target)
+        return
+
     with open(archive_path, "rb") as f:
         magic = f.read(4)
         
@@ -353,6 +419,30 @@ def extract_arch(data: bytes, target: Path):
             print(f"Error extracting Arch package: {e}")
             raise
 
+def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
+    with tempfile.TemporaryDirectory() as td:
+        pkg_path = Path(td) / "pkg.tar.zst"
+        pkg_path.write_bytes(pkg_data)
+        try:
+            subprocess.run(["tar", "--use-compress-program=zstd", "-xf", "pkg.tar.zst", ".INSTALL"],
+                           cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            return
+        install_file = Path(td) / ".INSTALL"
+        if not install_file.exists():
+            return
+        tmp_hook = root / "tmp" / "yapm_install_hook.sh"
+        tmp_hook.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(install_file, tmp_hook)
+        os.chmod(tmp_hook, 0o755)
+        script = f"source /tmp/yapm_install_hook.sh && if type {phase} >/dev/null 2>&1; then {phase}; fi"
+        print(f"  Running {phase} hook...")
+        if str(root) != "/":
+            subprocess.run(["arch-chroot", str(root), "bash", "-c", script], check=False)
+        else:
+            subprocess.run(["bash", "-c", script], check=False)
+        tmp_hook.unlink(missing_ok=True)
+
 # ============================================================
 # PACKAGE LOGIC
 # ============================================================
@@ -452,6 +542,10 @@ def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None) -> Optional
     return dict(entry)
 
 def update_index():
+    if config_flag("yapm.yapm"):
+        print("found 0 updates")
+        time.sleep(1)
+        print("just kidding")
     print("Updating package index...")
     merged_index = {"packages": {}}
     for mirror in sorted_mirrors():
@@ -527,10 +621,10 @@ def fetch_from_github(pkg_name: str, repo: str, version: Optional[str]) -> Optio
                     return data
     return None
 
-def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None) -> Optional[bytes]:
+def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None, arch_mode: bool = False) -> Optional[bytes]:
     idx = load_index()
     pkg_info = get_pkg_info(idx, pkg, version)
-    fmt = (pkg_info or {}).get("format", "yapm")
+    fmt = "arch" if arch_mode else (pkg_info or {}).get("format", "yapm")
     base = pkg_basename(pkg)
 
     def _try_at(m_url: str) -> Optional[bytes]:
@@ -538,6 +632,8 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
             download_path = (pkg_info or {}).get("download_path", "")
             if download_path:
                 return download(normalize(m_url) + download_path, desc=f"Downloading {pkg}")
+            if arch_mode:
+                print(f"Warning: Package '{pkg}' not found in Arch index. Skipping.")
             return None
         candidates = []
         if pkg_info and pkg_info.get("filename"):
@@ -569,7 +665,7 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
     return None
 
 def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], path: set, version: Optional[str] = None):
-    if pkg in to_install or pkg in db:
+    if pkg in to_install or pkg in db or pkg in VIRTUAL_PROVIDERS:
         return
     if pkg in path:
         print(f"Error: Circular dependency detected: {' -> '.join(path)} -> {pkg}")
@@ -580,16 +676,21 @@ def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], p
     if pkg_info:
         for dep in pkg_info.get("dependencies", []):
             import re
+            if dep in VIRTUAL_PROVIDERS:
+                continue
             if re.match(r'^lib.*\.so', dep) or re.search(r'\.so(\.[0-9]+)*$', dep):
                 continue
             resolve_dependencies(dep, idx, db, to_install, path)
+        to_install.append(pkg)
     else:
         print(f"Warning: Package '{pkg}' not found in index. Cannot resolve its dependencies.")
-
-    to_install.append(pkg)
     path.remove(pkg)
 
 def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
+    if config_flag("yapm.nativenationality") and fmt != "yapm":
+        print("yapm.nativenationality is enabled — only native .yapm packages allowed")
+        sys.exit(1)
+
     target = INSTALL_DIR / pkg_name
     if target.exists():
         shutil.rmtree(target)
@@ -651,6 +752,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                 if dest_path.exists() or dest_path.is_symlink():
                     os.unlink(dest_path)
                 shutil.copy2(src_path, dest_path)
+                chaos_yap_on_extract(src)
                 
         # RunFile
         run_file = content_info.get("RunFile")
@@ -661,6 +763,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             os.chmod(target / run_file, 0o755)
             os.symlink(target / run_file, dest)
             print(f"  Linked executable {Path(run_file).name} -> {dest}")
+            chaos_yap_on_extract(run_file)
             
         # PostInstall
         post_install = content_info.get("PostInstall")
@@ -699,148 +802,214 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
     save_db(db)
 
-def install_package(pkg: str, fmt: str, mirror_index: Optional[int] = None):
+def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False):
+    if config_flag("yapm.yapm"):
+        chaos_spinner(3)
+    if config_flag("yapm.autoupdate"):
+        update_index()
+
+    if root and root != "/":
+        if not config_flag("yapm.insroot"):
+            print("enable yapm.insroot to use this feature")
+            sys.exit(1)
+        set_root_dir(root)
+
     db = load_db()
     idx = load_index()
 
-    # Parse package@source=version
-    pkg_spec = pkg
-    pkg_version = None
-    if "=" in pkg_spec:
-        pkg_spec, pkg_version = pkg_spec.split("=", 1)
-
-    pkg_source = None
-    if "@" in pkg_spec:
-        pkg_name, pkg_source = pkg_spec.rsplit("@", 1)
-    else:
-        pkg_name = pkg_spec
-
-    pinned_mirror = None
-    is_github = False
-    github_repo = None
-    
-    if pkg_source:
-        if pkg_source.startswith("github:"):
-            is_github = True
-            github_repo = pkg_source[7:]
-        else:
-            mirrors = sorted_mirrors()
-            matched_mirror = None
-            for m in mirrors:
-                if pkg_source == m["url"]:
-                    matched_mirror = m["url"]
-                    break
-            if not matched_mirror:
-                for m in mirrors:
-                    if pkg_source in m["url"]:
-                        matched_mirror = m["url"]
-                        break
-            if matched_mirror:
-                pinned_mirror = matched_mirror
-            else:
-                print(f"Error: Unknown source '{pkg_source}' — not a configured mirror and not a github:User/Repo reference")
-                sys.exit(1)
-
+    global_pinned_mirror = None
     if mirror_index is not None:
-        mirrors = sorted_mirrors()
-        if mirror_index < 1 or mirror_index > len(mirrors):
+        all_mirrors = sorted_mirrors()
+        if mirror_index < 1 or mirror_index > len(all_mirrors):
             print(f"Error: mirror index {mirror_index} is out of range.")
             print("Available mirrors (use 'yapm mirror list' to see them):")
-            for i, m in enumerate(mirrors, 1):
+            for i, m in enumerate(all_mirrors, 1):
                 print(f"  [{i}] {m['url']} (priority {m['priority']})")
             sys.exit(1)
-        pinned_mirror = mirrors[mirror_index - 1]["url"]
-        print(f"Pinned to mirror [{mirror_index}]: {pinned_mirror}")
+        global_pinned_mirror = all_mirrors[mirror_index - 1]["url"]
+        print(f"Pinned to mirror [{mirror_index}]: {global_pinned_mirror}")
 
-    pkg_path = Path(pkg)
-    if pkg_path.is_file():
-        # Auto-detect format from extension if installing from a local file
-        if pkg_path.suffix == ".deb": fmt = "deb"
-        elif pkg_path.name.endswith(".pkg.tar.zst"): fmt = "arch"
-        elif pkg_path.suffix == ".yapm": fmt = "yapm"
+    arch_mode = global_pinned_mirror and "archlinux" in global_pinned_mirror
+    if arch_mode:
+        print("  → Arch mirror detected: forcing arch package format")
 
-        # Determine package name from file name
+    pre_fetched_data = {}
+    to_install_merged = []
+    seen = set()
+    pin_version = {}
+    pin_mirror = {}
+
+    local_installs = []
+
+    for pkg in packages:
+        pkg_spec = pkg
+        pkg_version = None
+        if "=" in pkg_spec:
+            pkg_spec, pkg_version = pkg_spec.split("=", 1)
+
+        pkg_source = None
+        if "@" in pkg_spec:
+            pkg_name, pkg_source = pkg_spec.rsplit("@", 1)
+        else:
+            pkg_name = pkg_spec
+
+        pkg_pinned_mirror = global_pinned_mirror
+        is_github = False
+        github_repo = None
+
+        pkg_path = Path(pkg_name)
+        if pkg_path.is_file():
+            local_installs.append(pkg_path)
+            continue
+
+        if pkg_source:
+            if pkg_source.startswith("github:"):
+                is_github = True
+                github_repo = pkg_source[7:]
+            else:
+                mirrors = sorted_mirrors()
+                matched_mirror = None
+                for m in mirrors:
+                    if pkg_source == m["url"]:
+                        matched_mirror = m["url"]
+                        break
+                if not matched_mirror:
+                    for m in mirrors:
+                        if pkg_source in m["url"]:
+                            matched_mirror = m["url"]
+                            break
+                if matched_mirror:
+                    pkg_pinned_mirror = matched_mirror
+                else:
+                    print(f"Error: Unknown source '{pkg_source}' — not a configured mirror and not a github:User/Repo reference")
+                    sys.exit(1)
+
+        if is_github and github_repo:
+            print(f"Fetching {pkg_name} from GitHub ({github_repo})...")
+            data = fetch_from_github(pkg_name, github_repo, pkg_version)
+            if not data:
+                print(f"Failed to fetch {pkg_name} from GitHub. Aborting.")
+                sys.exit(1)
+            pre_fetched_data[pkg_name] = data
+            meta = {}
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    for member in z.infolist():
+                        if member.filename.endswith("yapm.data"):
+                            content = z.read(member.filename).decode('utf-8')
+                            y_data = parse_yapm_data(content)
+                            meta = y_data.get("METADATA", {})
+                            break
+            except Exception:
+                pass
+            idx.setdefault("packages", {})[pkg_name] = {
+                "version": meta.get("version", "0.0.0"),
+                "dependencies": meta.get("dependencies", []),
+                "format": "yapm"
+            }
+
+        pin_version[pkg_name] = pkg_version
+        pin_mirror[pkg_name] = pkg_pinned_mirror
+        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, version=pkg_version)
+
+    for pkg_path in local_installs:
+        local_fmt = fmt
+        if pkg_path.suffix == ".deb": local_fmt = "deb"
+        elif pkg_path.name.endswith(".pkg.tar.zst"): local_fmt = "arch"
+        elif pkg_path.suffix == ".yapm": local_fmt = "yapm"
+
         if pkg_path.name.endswith(".pkg.tar.zst"):
             pkg_name = pkg_path.name[:-12]
         else:
             pkg_name = pkg_path.stem
 
-        print(f"Installing {fmt.upper()} from local file: {pkg_path}")
+        print(f"Installing {local_fmt.upper()} from local file: {pkg_path}")
         with open(pkg_path, "rb") as f:
             data = f.read()
-        _install_single(pkg_name, db, data, fmt)
-        
-        if fmt == "arch":
+        _install_single(pkg_name, db, data, local_fmt)
+        if local_fmt == "arch":
+            if config_flag("yapm.hooks"):
+                run_pkg_install_hook(data, ROOT_DIR, "post_install")
             pkginfo = parse_pkginfo(data)
             if pkginfo:
                 db[pkg_name]["version"] = pkginfo.get("pkgver", "0.0.0")
                 db[pkg_name]["dependencies"] = pkginfo.get("depends", [])
                 db[pkg_name].setdefault("metadata", {})["description"] = pkginfo.get("pkgdesc", "")
                 save_db(db)
-                
         print(f"Installed {pkg_name} successfully.")
+
+    if not to_install_merged:
+        if not local_installs:
+            print("Nothing to install.")
         return
 
-    pre_fetched_data = {}
-    if is_github and github_repo:
-        print(f"Fetching {pkg_name} from GitHub ({github_repo})...")
-        data = fetch_from_github(pkg_name, github_repo, pkg_version)
-        if not data:
-            print(f"Failed to fetch {pkg_name} from GitHub. Aborting.")
-            sys.exit(1)
-        
-        pre_fetched_data[pkg_name] = data
-        
-        meta = {}
+    print(f"The following packages will be installed: {', '.join(to_install_merged)}")
+
+    if config_flag("yapm.yapm"):
+        chaos_confirm(3)
+        for p in to_install_merged:
+            chaos_delay(0.5)
+            print(f"  → {chaos_wrong_name(p)}")
+        print()
+        chaos_opinion(to_install_merged[0])
+
+    if not noconfirm and not config_flag("yapm.noconfirm"):
         try:
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                for member in z.infolist():
-                    if member.filename.endswith("yapm.data"):
-                        content = z.read(member.filename).decode('utf-8')
-                        y_data = parse_yapm_data(content)
-                        meta = y_data.get("METADATA", {})
-                        break
-        except Exception:
-            pass
-            
-        idx.setdefault("packages", {})[pkg_name] = {
-            "version": meta.get("version", "0.0.0"),
-            "dependencies": meta.get("dependencies", []),
-            "format": "yapm"
-        }
+            choice = input("Proceed with installation? [Y/n] ").strip().lower()
+            if choice not in ('', 'y', 'yes'):
+                print("Aborted.")
+                sys.exit(0)
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(0)
 
-    # Remote installations
-    if pkg_name in db:
-        ver_text = f" ({pkg_version})" if pkg_version else ""
-        print(f"{pkg_name} is already installed.{ver_text}")
-        return
+    for p in to_install_merged:
+        p_ver = pin_version.get(p)
+        p_mirror = pin_mirror.get(p)
+        chaos_interrupt()
+        display_p = chaos_wrong_name(p)
+        print(f"Installing {display_p}...")
 
-    to_install = []
-    resolve_dependencies(pkg_name, idx, db, to_install, set(), version=pkg_version)
-
-    if not to_install:
-        print("Nothing to install.")
-        return
-
-    ver_text = f" (pinning v{pkg_version})" if pkg_version else ""
-    print(f"The following packages will be installed:{ver_text}")
-    for p in to_install:
-        p_ver = pkg_version if p == pkg_name else None
-        print(f"Installing {p}...")
-        
         if p in pre_fetched_data:
             data = pre_fetched_data[p]
         else:
-            data = fetch_package(p, mirror_url=pinned_mirror, version=p_ver)
-            
+            data = fetch_package(p, mirror_url=p_mirror, version=p_ver, arch_mode=arch_mode)
+
         if not data:
             print(f"Failed to fetch {p}. Aborting.")
             sys.exit(1)
 
-        pkg_info = get_pkg_info(idx, p, p_ver)
-        fetched_fmt = (pkg_info or {}).get("format", "yapm")
+        fetched_fmt = "arch" if arch_mode else (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
+
+        if config_flag("yapm.paranoid"):
+            expected_fmt = fetched_fmt
+            if data[:2] == b'PK':
+                actual_fmt = "yapm" if expected_fmt in ("yapm", "deb") else None
+            elif data[:4] == b'\x28\xb5\x2f\xfd':
+                actual_fmt = "arch"
+            else:
+                actual_fmt = None
+            if expected_fmt == "deb":
+                actual_fmt = "yapm" if data[:2] == b'PK' else None
+            if expected_fmt == "arch":
+                actual_fmt = "arch" if data[:4] == b'\x28\xb5\x2f\xfd' else "deb" if data[:2] == b'PK' else None
+            if not actual_fmt or actual_fmt != expected_fmt:
+                print(f"Warning: Package '{p}' has mismatched format (expected {expected_fmt}, got {actual_fmt or 'unknown'}). Refusing to install.")
+                sys.exit(1)
+
         _install_single(p, db, data, fetched_fmt)
-        print(f"Installed {p}.")
+        if fetched_fmt == "arch" and config_flag("yapm.hooks"):
+            run_pkg_install_hook(data, ROOT_DIR, "post_install")
+        print(f"Installed {chaos_wrong_name(p)}.")
+
+    if "linux" in to_install_merged and str(ROOT_DIR) != "/":
+        print("Running mkinitcpio for bootstrapped system...")
+        subprocess.run(["arch-chroot", str(ROOT_DIR), "mkinitcpio", "-P"], check=False)
+
+    if config_flag("yapm.yapm"):
+        print("something may or may not have gone wrong. who can say really")
+
+    chaos_post_operation()
 
 def remove_package(pkg: str):
     db = load_db()
@@ -867,7 +1036,9 @@ def remove_package(pkg: str):
     save_db(db)
     print(f"Removed {format_key(pkg_key)}.")
 
-def upgrade_packages():
+def upgrade_packages(refresh: bool = False):
+    if refresh or config_flag("yapm.autoupdate"):
+        update_index()
     db = load_db()
     idx = load_index()
 
@@ -893,6 +1064,7 @@ def upgrade_packages():
         print(f"  {pkg} ({db[pkg].get('version', '0.0.0')} -> {ver})")
 
     for pkg, ver in to_upgrade:
+        chaos_interrupt()
         print(f"Upgrading {pkg}...")
         data = fetch_package(pkg, version=ver)
         if not data:
@@ -900,6 +1072,8 @@ def upgrade_packages():
             continue
         _install_single(pkg, db, data, "yapm")
         print(f"Upgraded {pkg}.")
+
+    chaos_post_operation()
 
 def list_installed():
     db = load_db()
@@ -1070,6 +1244,142 @@ def build_package(directory: str):
     print(f"Success! Package built: {out_file}")
 
 # ============================================================
+# CONFIG COMMAND
+# ============================================================
+
+HIDDEN_FLAGS = {"yapm.yapm"}
+
+def yapm_config_list():
+    conf = load_yapm_conf()
+    for flag in KNOWN_FLAGS:
+        if flag in HIDDEN_FLAGS:
+            continue
+        state = "on" if conf.get(flag, str(KNOWN_FLAGS[flag]).lower()) == "true" else "off"
+        print(f"  {flag} = {state}  (beta)")
+
+def yapm_config_enable(flag: str):
+    if flag in HIDDEN_FLAGS:
+        print(f"unknown flag: {flag}")
+        sys.exit(1)
+    if flag not in KNOWN_FLAGS:
+        print(f"unknown flag: {flag}")
+        sys.exit(1)
+    conf = load_yapm_conf()
+    conf[flag] = "true"
+    save_yapm_conf(conf)
+    print(f"  {flag} = on")
+
+def yapm_config_disable(flag: str):
+    if flag in HIDDEN_FLAGS:
+        print(f"unknown flag: {flag}")
+        sys.exit(1)
+    if flag not in KNOWN_FLAGS:
+        print(f"unknown flag: {flag}")
+        sys.exit(1)
+    conf = load_yapm_conf()
+    conf[flag] = "false"
+    save_yapm_conf(conf)
+    print(f"  {flag} = off")
+
+# ============================================================
+# CHAOS MODE
+# ============================================================
+
+import random
+import time
+
+CHAOS_THROWBACKS = [
+    "yapm? more like yap",
+    "WARNING: yapm may conflict with your will to live",
+    "have you considered just using pacman",
+    "have you considered just using apt",
+    "have you considered just using dnf",
+    "don't install it, you don't need it!",
+    "still here!",
+    "extracting... (this is the part where we wait)",
+    "you're doing great by the way",
+    "what even IS a package really",
+]
+
+CHAOS_WRONG_NAMES = {
+    "linux": "linus",
+    "grub": "grub2",
+    "bash": "baxh",
+    "systemd": "systemd... (ugh)",
+    "python": "pythong",
+    "python3": "pythong3",
+}
+
+def chaos_interrupt():
+    if not config_flag("yapm.yapm"):
+        return
+    if random.random() < 0.3:
+        print(random.choice(CHAOS_THROWBACKS), file=sys.stderr)
+
+def chaos_delay(seconds=0.5):
+    time.sleep(seconds)
+
+def chaos_spinner(seconds=3):
+    import itertools
+    spinner = itertools.cycle(["|", "/", "-", "\\"])
+    for _ in range(int(seconds * 10)):
+        sys.stdout.write(f"\rthinking... {next(spinner)}")
+        sys.stdout.flush()
+        time.sleep(0.1)
+    sys.stdout.write("\r" + " " * 20 + "\r")
+    sys.stdout.flush()
+
+def chaos_confirm(times=3):
+    for i in range(times):
+        try:
+            choice = input(f"are you sure? (type 'yes' to confirm) [{i+1}/{times}] ").strip().lower()
+            if choice != "yes":
+                print("Aborted.")
+                sys.exit(0)
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(0)
+
+def chaos_wrong_name(name: str) -> str:
+    if config_flag("yapm.yapm"):
+        base = name.split("-")[0].split(".")[0].lower()
+        if base in CHAOS_WRONG_NAMES:
+            return CHAOS_WRONG_NAMES[base]
+    return name
+
+def chaos_yap_on_extract(filename: str):
+    if not config_flag("yapm.yapm"):
+        return
+    comments = [
+        "ooh this one's a big one",
+        "never heard of THIS library before",
+        f"extracting {filename}... classic",
+        "wow another .so file who would have thought",
+    ]
+    if random.random() < 0.15:
+        print(f"  > {random.choice(comments)}")
+
+def chaos_opinion(pkg: str):
+    if not config_flag("yapm.yapm"):
+        return
+    base = pkg.split("-")[0].split(".")[0].lower()
+    opinions = {
+        "networkmanager": "networkmanager? bold choice",
+        "network-manager": "networkmanager? bold choice",
+        "vim": "you're installing vim? interesting life decision",
+        "linux": "oh linux, a personal favorite",
+    }
+    if base in opinions:
+        print(f"  > {opinions[base]}")
+
+def chaos_post_operation():
+    if not config_flag("yapm.yapm"):
+        return
+    print("done! ...or did i?")
+    time.sleep(1)
+    print("yes i did :)")
+
+# ============================================================
 # CLI
 # ============================================================
 
@@ -1102,11 +1412,15 @@ def main():
                     "Dependencies listed in yapm.data are resolved and installed first.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_install.add_argument("package", metavar="PACKAGE",
-                           help="Package name (looked up in index) or path to a local package file")
+    p_install.add_argument("package", metavar="PACKAGE", nargs="+",
+                           help="Package name(s) (looked up in index) or path(s) to local package file(s)")
     p_install.add_argument("-m", "--mirror", type=int, default=None, metavar="N",
                            help="Pin install to a specific mirror by its index number from "
                                 "'yapm mirror list' (e.g. -m 5 for mirror #5)")
+    p_install.add_argument("-r", "--root", type=str, default=None, metavar="PATH",
+                           help="Install to a different root directory (requires yapm.insroot)")
+    p_install.add_argument("-y", "--noconfirm", action="store_true",
+                           help="Skip confirmation prompt")
 
     # remove
     p_remove = sub.add_parser(
@@ -1159,13 +1473,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # upgrade
-    sub.add_parser(
+    p_upgrade = sub.add_parser(
         "upgrade",
         help="Upgrade all installed packages to their latest versions",
         description="Compare installed package versions against the cached index and\n"
                     "re-download any packages where a newer version is available.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p_upgrade.add_argument("-y", "--refresh", action="store_true",
+                           help="Refresh the package index before upgrading")
     # fetch
     p_fetch = sub.add_parser(
         "fetch",
@@ -1209,6 +1525,16 @@ def main():
     )
     p_build.add_argument("directory", metavar="DIR",
                          help="Path to the directory containing package files and yapm.data")
+
+    # config (hidden)
+    p_config = sub.add_parser("config", help=argparse.SUPPRESS)
+    config_sub = p_config.add_subparsers(dest="config_cmd", required=True, metavar="<action>")
+
+    p_config_list = config_sub.add_parser("list", help=argparse.SUPPRESS)
+    p_config_enable = config_sub.add_parser("enable", help=argparse.SUPPRESS)
+    p_config_enable.add_argument("flag", metavar="FLAG", help=argparse.SUPPRESS)
+    p_config_disable = config_sub.add_parser("disable", help=argparse.SUPPRESS)
+    p_config_disable.add_argument("flag", metavar="FLAG", help=argparse.SUPPRESS)
 
     # mirror
     p_mirror = sub.add_parser(
@@ -1260,8 +1586,18 @@ def main():
     require_root()
     ensure_dirs()
 
+    if config_flag("yapm.yapm"):
+        try:
+            _dispatch(args)
+        except SystemExit:
+            print("something may or may not have gone wrong. who can say really")
+            sys.exit(0)
+    else:
+        _dispatch(args)
+
+def _dispatch(args):
     if args.command == "install":
-        install_package(args.package, args.format, mirror_index=args.mirror)
+        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm)
     elif args.command == "remove":
         remove_package(args.package)
     elif args.command == "list":
@@ -1273,16 +1609,20 @@ def main():
     elif args.command == "update":
         update_index()
     elif args.command == "upgrade":
-        upgrade_packages()
+        upgrade_packages(refresh=args.refresh)
     elif args.command == "build":
         build_package(args.directory)
     elif args.command == "version":
-        ver = "unknown"
+        ver = APP_VERSION
+        if config_flag("yapm.riot"):
+            ver = f"{APP_VERSION}-riot"
+        print(f"yapm version {ver}")
+        if not config_flag("yapm.riot"):
+            print("riot features available via yapm.conf")
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE) as f:
-                ver = json.load(f).get("version", "unknown")
-        print(f"yapm version {APP_VERSION}")
-        print(f"config version {ver}")
+                cv = json.load(f).get("version", "unknown")
+            print(f"config version {cv}")
     elif args.command == "uninstall":
         uninstall_yapm()
     elif args.command == "fetch":
@@ -1296,6 +1636,14 @@ def main():
             mirror_refresh()
         elif args.mirror_cmd == "list":
             mirror_list()
+
+    elif args.command == "config":
+        if args.config_cmd == "list":
+            yapm_config_list()
+        elif args.config_cmd == "enable":
+            yapm_config_enable(args.flag)
+        elif args.config_cmd == "disable":
+            yapm_config_disable(args.flag)
 
 if __name__ == "__main__":
     main()
