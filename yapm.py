@@ -579,6 +579,9 @@ def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], p
     pkg_info = get_pkg_info(idx, pkg, version)
     if pkg_info:
         for dep in pkg_info.get("dependencies", []):
+            import re
+            if re.match(r'^lib.*\.so', dep) or re.search(r'\.so(\.[0-9]+)*$', dep):
+                continue
             resolve_dependencies(dep, idx, db, to_install, path)
     else:
         print(f"Warning: Package '{pkg}' not found in index. Cannot resolve its dependencies.")
