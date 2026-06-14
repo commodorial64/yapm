@@ -22,7 +22,7 @@ VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.2.1-alpha"
+APP_VERSION = "0.3.0-alpha"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
@@ -829,7 +829,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         global_pinned_mirror = all_mirrors[mirror_index - 1]["url"]
         print(f"Pinned to mirror [{mirror_index}]: {global_pinned_mirror}")
 
-    arch_mode = global_pinned_mirror and "archlinux" in global_pinned_mirror
+    arch_mode = global_pinned_mirror is not None and "archlinux" in global_pinned_mirror
     if arch_mode:
         print("  → Arch mirror detected: forcing arch package format")
 
