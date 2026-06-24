@@ -22,7 +22,7 @@ VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.3.0-alpha"
+APP_VERSION = "0.3.1-alpha"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
