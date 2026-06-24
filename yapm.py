@@ -196,7 +196,7 @@ def validate_mirror(url: str) -> bool:
         if url.startswith("file://"):
             return Path(url[7:]).exists()
         req = urllib.request.Request(normalize(url), method="HEAD", headers={'User-Agent': 'yapm/1.0'})
-        with urllib.request.urlopen(req, timeout=3) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             return r.status < 400
     except Exception:
         return False
@@ -204,7 +204,7 @@ def validate_mirror(url: str) -> bool:
 def download(url: str, desc: str = "Downloading", silent_errors: bool = False) -> Optional[bytes]:
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'yapm/1.0'})
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=120) as response:
             size = int(response.headers.get('content-length', 0))
             data = b""
             chunk_size = 8192
