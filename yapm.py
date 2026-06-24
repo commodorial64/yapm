@@ -1140,7 +1140,7 @@ def uninstall_yapm():
     shutil.rmtree("/var/lib/yapm", ignore_errors=True)
     print("Successfully uninstalled yapm.")
 
-YAPM_SOURCE_URL = "https://raw.githubusercontent.com/galaxyg144/yapm/main/yapm.py"
+YAPM_SOURCE_URL = "https://raw.githubusercontent.com/commodorial64/yapm/main/yapm.py"
 
 def update_yapm(force: bool = False):
     import re
