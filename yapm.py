@@ -139,10 +139,16 @@ def save_yapm_conf(overrides: Dict[str, str]):
 
 def config_flag(name: str) -> bool:
     conf = load_yapm_conf()
+    riot = conf.get("yapm.riot", "false").lower() == "true"
+    if riot and name in ("yapm.insroot", "yapm.hooks", "yapm.noconfirm"):
+        return True
     val = conf.get(name, str(KNOWN_FLAGS.get(name, "false")))
     return val.lower() == "true"
 
 def load_db() -> Dict:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not DB_FILE.exists():
+        DB_FILE.write_text("{}")
     with open(DB_FILE) as f:
         db = json.load(f)
     migrated = False
@@ -463,13 +469,12 @@ def parse_debian_index(mirror_url: str, merged_index: dict):
             if not line.strip():
                 if current_pkg and "name" in current_pkg:
                     name = current_pkg["name"]
-                    if name not in merged_index["packages"]:
-                        merged_index["packages"][name] = {
-                            "version": current_pkg.get("version", "0.0.0"),
-                            "mirror": mirror_url,
-                            "format": "deb",
-                            "download_path": current_pkg.get("filename", "")
-                        }
+                    merged_index["packages"].setdefault(name, {})["deb"] = {
+                        "version": current_pkg.get("version", "0.0.0"),
+                        "mirror": mirror_url,
+                        "format": "deb",
+                        "download_path": current_pkg.get("filename", "")
+                    }
                 current_pkg = {}
                 continue
                 
@@ -480,52 +485,73 @@ def parse_debian_index(mirror_url: str, merged_index: dict):
         print(f"Error parsing Debian index: {e}")
 
 def parse_arch_index(mirror_url: str, merged_index: dict):
-    url = normalize(mirror_url) + "core/os/x86_64/core.db"
-    data = download(url, desc=f"Fetching Arch index from {mirror_url}")
-    if not data: return
-    
-    try:
-        print("  Parsing Arch core.db...")
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            for member in tar.getmembers():
-                if member.name.endswith("desc"):
-                    f = tar.extractfile(member)
-                    if f:
-                        content = f.read().decode('utf-8', errors='ignore')
-                        lines = content.splitlines()
-                        name, version, arch = "", "", "x86_64"
-                        dependencies = []
-                        for i, line in enumerate(lines):
-                            if line == "%NAME%": name = lines[i+1]
-                            elif line == "%VERSION%": version = lines[i+1]
-                            elif line == "%ARCH%": arch = lines[i+1]
-                            elif line == "%DEPENDS%":
-                                j = i + 1
-                                while j < len(lines) and lines[j] and not lines[j].startswith("%"):
-                                    dep = lines[j]
-                                    for char in ('<', '>', '='):
-                                        dep = dep.split(char)[0]
-                                    dependencies.append(dep)
-                                    j += 1
-                        
-                        if name and name not in merged_index["packages"]:
-                            merged_index["packages"][name] = {
-                                "version": version,
-                                "mirror": mirror_url,
-                                "format": "arch",
-                                "dependencies": dependencies,
-                                "download_path": f"core/os/x86_64/{name}-{version}-{arch}.pkg.tar.zst"
-                            }
-    except Exception as e:
-        print(f"Error parsing Arch index: {e}")
+    for repo in ("core", "extra"):
+        url = normalize(mirror_url) + f"{repo}/os/x86_64/{repo}.db"
+        data = download(url, desc=f"Fetching Arch {repo} index from {mirror_url}")
+        if not data:
+            continue
 
-def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None) -> Optional[dict]:
-    """Look up a specific version of a package."""
+        try:
+            print(f"  Parsing Arch {repo}.db...")
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name.endswith("desc"):
+                        f = tar.extractfile(member)
+                        if f:
+                            content = f.read().decode('utf-8', errors='ignore')
+                            lines = content.splitlines()
+                            name, version, arch = "", "", "x86_64"
+                            dependencies = []
+                            for i, line in enumerate(lines):
+                                if line == "%NAME%": name = lines[i+1]
+                                elif line == "%VERSION%": version = lines[i+1]
+                                elif line == "%ARCH%": arch = lines[i+1]
+                                elif line == "%DEPENDS%":
+                                    j = i + 1
+                                    while j < len(lines) and lines[j] and not lines[j].startswith("%"):
+                                        dep = lines[j]
+                                        for char in ('<', '>', '='):
+                                            dep = dep.split(char)[0]
+                                        dependencies.append(dep)
+                                        j += 1
+
+                            if name:
+                                # Don't overwrite an entry already found in a higher-priority repo
+                                merged_index["packages"].setdefault(name, {}).setdefault("arch", {
+                                    "version": version,
+                                    "mirror": mirror_url,
+                                    "format": "arch",
+                                    "dependencies": dependencies,
+                                    "download_path": f"{repo}/os/x86_64/{name}-{version}-{arch}.pkg.tar.zst"
+                                })
+        except Exception as e:
+            print(f"Error parsing Arch {repo} index: {e}")
+
+def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None, arch_mode: bool = False) -> Optional[dict]:
+    """Look up a specific version of a package.
+
+    The index stores per-format entries as ``{pkg_name: {format: entry_dict}}``.
+    When *arch_mode* is ``True`` only the ``"arch"`` sub-entry is considered;
+    otherwise the priority order is ``yapm > arch > deb``.
+    """
     packages = idx.get("packages", {})
     entry = packages.get(pkg)
-
     if not entry:
         return None
+
+    # entry is now a dict keyed by format — select the right sub-entry
+    if arch_mode:
+        sub = entry.get("arch")
+        if not sub:
+            return None
+        entry = sub
+    else:
+        for fmt in ("yapm", "arch", "deb"):
+            if fmt in entry:
+                entry = entry[fmt]
+                break
+        else:
+            return None
 
     if "versions" in entry:
         ver = version or entry.get("latest", "0.0.0")
@@ -569,19 +595,19 @@ def update_index():
                         if "/" in pkg_name:
                             pkg_name = pkg_name.split("/", 1)[-1]
                             
-                        if pkg_name in merged_index["packages"]:
-                            continue
                         if "versions" in pkg_info:
-                            merged_index["packages"][pkg_name] = {
+                            merged_index["packages"].setdefault(pkg_name, {})["yapm"] = {
                                 "latest": pkg_info.get("latest", ""),
                                 "mirror": url,
                                 "format": "yapm",
                                 "versions": pkg_info.get("versions", {})
                             }
                         else:
-                            pkg_info["mirror"] = url
-                            pkg_info["format"] = "yapm"
-                            merged_index["packages"][pkg_name] = pkg_info
+                            merged_index["packages"].setdefault(pkg_name, {})["yapm"] = {
+                                **pkg_info,
+                                "mirror": url,
+                                "format": "yapm"
+                            }
                 except Exception as e:
                     print(f"Error parsing index from {url}: {e}")
 
@@ -598,8 +624,15 @@ def load_index() -> Dict:
     new_pkgs = {}
     for k, v in idx.get("packages", {}).items():
         name = k.split("/", 1)[-1] if "/" in k else k
-        if name not in new_pkgs:
-            new_pkgs[name] = v
+        if name in new_pkgs:
+            continue
+        # Convert old flat entries (e.g. {"version": …, "format": "deb"})
+        # to the new nested-by-format format {fmt: entry_dict}.
+        if any(fmt in v for fmt in ("yapm", "arch", "deb")):
+            new_pkgs[name] = v          # already new format
+        else:
+            fmt = v.get("format", "yapm")
+            new_pkgs[name] = {fmt: v}   # wrap old flat entry
     idx["packages"] = new_pkgs
     return idx
 
@@ -623,7 +656,7 @@ def fetch_from_github(pkg_name: str, repo: str, version: Optional[str]) -> Optio
 
 def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None, arch_mode: bool = False) -> Optional[bytes]:
     idx = load_index()
-    pkg_info = get_pkg_info(idx, pkg, version)
+    pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
     fmt = "arch" if arch_mode else (pkg_info or {}).get("format", "yapm")
     base = pkg_basename(pkg)
 
@@ -633,7 +666,7 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
             if download_path:
                 return download(normalize(m_url) + download_path, desc=f"Downloading {pkg}")
             if arch_mode:
-                print(f"Warning: Package '{pkg}' not found in Arch index. Skipping.")
+                print(f"Warning: Package '{pkg}' not found in Arch index (mirror is pinned to Arch). Skipping.")
             return None
         candidates = []
         if pkg_info and pkg_info.get("filename"):
@@ -664,7 +697,7 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
             return data
     return None
 
-def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], path: set, version: Optional[str] = None):
+def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], path: set, version: Optional[str] = None, arch_mode: bool = False):
     if pkg in to_install or pkg in db or pkg in VIRTUAL_PROVIDERS:
         return
     if pkg in path:
@@ -672,7 +705,7 @@ def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], p
         sys.exit(1)
 
     path.add(pkg)
-    pkg_info = get_pkg_info(idx, pkg, version)
+    pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
     if pkg_info:
         for dep in pkg_info.get("dependencies", []):
             import re
@@ -680,10 +713,13 @@ def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], p
                 continue
             if re.match(r'^lib.*\.so', dep) or re.search(r'\.so(\.[0-9]+)*$', dep):
                 continue
-            resolve_dependencies(dep, idx, db, to_install, path)
+            resolve_dependencies(dep, idx, db, to_install, path, arch_mode=arch_mode)
         to_install.append(pkg)
     else:
-        print(f"Warning: Package '{pkg}' not found in index. Cannot resolve its dependencies.")
+        if arch_mode:
+            print(f"Warning: Package '{pkg}' not found in Arch index (mirror is pinned to Arch). Skipping.")
+        else:
+            print(f"Warning: Package '{pkg}' not found in index. Cannot resolve its dependencies.")
     path.remove(pkg)
 
 def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
@@ -761,7 +797,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             if dest.exists() or dest.is_symlink():
                 os.unlink(dest)
             os.chmod(target / run_file, 0o755)
-            os.symlink(target / run_file, dest)
+            os.symlink(Path("/") / (target / run_file).relative_to(ROOT_DIR), dest)
             print(f"  Linked executable {Path(run_file).name} -> {dest}")
             chaos_yap_on_extract(run_file)
             
@@ -781,7 +817,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                         dest = BIN_DIR / item.name
                         if dest.exists() or dest.is_symlink():
                             os.unlink(dest)
-                        os.symlink(item, dest)
+                        os.symlink(Path("/") / item.relative_to(ROOT_DIR), dest)
                         print(f"  Linked {item.name} -> {dest}")
 
         metadata_path = target / "metadata.json"
@@ -902,7 +938,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
                             break
             except Exception:
                 pass
-            idx.setdefault("packages", {})[pkg_name] = {
+            idx.setdefault("packages", {}).setdefault(pkg_name, {})["yapm"] = {
                 "version": meta.get("version", "0.0.0"),
                 "dependencies": meta.get("dependencies", []),
                 "format": "yapm"
@@ -910,7 +946,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
 
         pin_version[pkg_name] = pkg_version
         pin_mirror[pkg_name] = pkg_pinned_mirror
-        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, version=pkg_version)
+        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, version=pkg_version, arch_mode=arch_mode)
 
     for pkg_path in local_installs:
         local_fmt = fmt
@@ -1045,7 +1081,11 @@ def upgrade_packages(refresh: bool = False):
     to_upgrade = []
     for pkg, info in db.items():
         local_ver = info.get("version", "0.0.0")
-        remote_info = idx.get("packages", {}).get(pkg)
+        formats_entry = idx.get("packages", {}).get(pkg)
+        if not formats_entry:
+            continue
+        installed_fmt = info.get("format", "yapm")
+        remote_info = formats_entry.get(installed_fmt)
         if not remote_info:
             continue
         if "versions" in remote_info:
@@ -1164,17 +1204,22 @@ def info_package(pkg: str):
         print("Status: Not installed")
 
     if pkg_key in idx.get("packages", {}):
-        entry = idx["packages"][pkg_key]
-        if "versions" in entry:
-            print(f"Available versions: {', '.join(sorted(entry['versions'].keys()))}")
-            print(f"Latest: {entry.get('latest', 'unknown')}")
-            ver_info = entry["versions"].get(entry.get("latest", ""), {})
-            if "dependencies" in ver_info and ver_info["dependencies"]:
-                print(f"Dependencies: {', '.join(ver_info['dependencies'])}")
-        else:
-            print(f"Remote Version: {entry.get('version', '0.0.0')}")
-            if "dependencies" in entry and entry["dependencies"]:
-                print(f"Remote Dependencies: {', '.join(entry['dependencies'])}")
+        formats_entry = idx["packages"][pkg_key]
+        for fmt_name in ("yapm", "arch", "deb"):
+            entry = formats_entry.get(fmt_name)
+            if not entry:
+                continue
+            print(f"[{fmt_name.upper()} format]")
+            if "versions" in entry:
+                print(f"  Available versions: {', '.join(sorted(entry['versions'].keys()))}")
+                print(f"  Latest: {entry.get('latest', 'unknown')}")
+                ver_info = entry["versions"].get(entry.get("latest", ""), {})
+                if "dependencies" in ver_info and ver_info["dependencies"]:
+                    print(f"  Dependencies: {', '.join(ver_info['dependencies'])}")
+            else:
+                print(f"  Remote Version: {entry.get('version', '0.0.0')}")
+                if "dependencies" in entry and entry["dependencies"]:
+                    print(f"  Remote Dependencies: {', '.join(entry['dependencies'])}")
     else:
         print("Not found in remote index.")
 
@@ -1183,22 +1228,26 @@ def search_package(term: str):
     found = False
     term_lower = term.lower()
 
-    for pkg_key, pkg_info in idx.get("packages", {}).items():
+    for pkg_key, formats_entry in idx.get("packages", {}).items():
         display = pkg_key
         display_lower = display.lower()
 
-        if "versions" in pkg_info:
-            latest_ver = pkg_info.get("latest", "")
-            ver_info = pkg_info["versions"].get(latest_ver, {})
+        for fmt_name in ("yapm", "arch", "deb"):
+            entry = formats_entry.get(fmt_name)
+            if not entry:
+                continue
+            if "versions" in entry:
+                latest_ver = entry.get("latest", "")
+                ver_info = entry["versions"].get(latest_ver, {})
+            else:
+                latest_ver = entry.get("version", "0.0.0")
+                ver_info = entry
             desc = ver_info.get("description", "").lower()
-        else:
-            latest_ver = pkg_info.get("version", "0.0.0")
-            desc = pkg_info.get("description", "").lower()
-            ver_info = pkg_info
 
-        if term_lower in display_lower or term_lower in desc:
-            print(f"{display} (v{latest_ver}) - {ver_info.get('description', 'No description')}")
-            found = True
+            if term_lower in display_lower or term_lower in desc:
+                print(f"{display} (v{latest_ver}) - {ver_info.get('description', 'No description')}")
+                found = True
+                break
 
     if not found:
         print("No matches found in local index. Try 'yapm update' first.")
