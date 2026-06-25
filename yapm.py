@@ -23,7 +23,7 @@ VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
 # ============================================================
 
 APP_VERSION = "0.3.1-alpha"
-CURRENT_VERSION = 1  # Config version
+CURRENT_VERSION = 2  # Config version
 
 # yapm always runs as root — all paths are system-wide
 CONFIG_DIR  = Path("/etc/yapm")
@@ -217,10 +217,21 @@ def download(url: str, desc: str = "Downloading", silent_errors: bool = False) -
                 if size:
                     percent = int(downloaded * 100 / size)
                     cols, _ = shutil.get_terminal_size((80, 20))
-                    bar_len = min(40, cols - len(desc) - 20)
+                    bar_len = min(40, cols - len(desc) - 30)
+                    if bar_len < 10: bar_len = 10
                     filled = int(bar_len * downloaded / size)
-                    bar = "█" * filled + "-" * (bar_len - filled)
-                    print(f"\r{desc}: [{bar}] {percent}% ({downloaded}/{size} bytes)", end="", flush=True)
+                    
+                    if filled >= bar_len:
+                        bar = "=" * bar_len
+                    else:
+                        bar = "=" * filled + ">" + " " * (bar_len - filled - 1)
+                        
+                    brown = "\033[38;2;160;120;90m"
+                    reset = "\033[0m"
+                    
+                    sz_str = f"{downloaded/1048576:.1f}/{size/1048576:.1f}MB" if size > 1048576 else f"{downloaded/1024:.0f}/{size/1024:.0f}KB"
+                    
+                    print(f"\r\033[K{brown}/yapm > {desc} [{bar}] {percent:3d}%{reset} \033[38;5;242m({sz_str})\033[0m", end="", flush=True)
             print()
             return data
     except urllib.error.HTTPError as e:
