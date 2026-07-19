@@ -1,22 +1,55 @@
 #!/usr/bin/env python3
 
 import argparse
+import ast
+import fcntl
+import gzip
+import io
+import itertools
 import json
 import os
+import random
+import re
 import shutil
+import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import urllib.request
 import urllib.error
 import zipfile
-import subprocess
-import gzip
-import tarfile
-import io
 from pathlib import Path
 from typing import List, Dict, Optional
 
 VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
+
+# ============================================================
+# COLOR OUTPUT
+# ============================================================
+
+_COLOR_ENABLED = sys.stdout.isatty()
+
+class Color:
+    RESET   = "\033[0m"  if _COLOR_ENABLED else ""
+    BOLD    = "\033[1m"   if _COLOR_ENABLED else ""
+    RED     = "\033[31m"  if _COLOR_ENABLED else ""
+    GREEN   = "\033[32m"  if _COLOR_ENABLED else ""
+    YELLOW  = "\033[33m"  if _COLOR_ENABLED else ""
+    BLUE    = "\033[34m"  if _COLOR_ENABLED else ""
+    CYAN    = "\033[36m"  if _COLOR_ENABLED else ""
+    DIM     = "\033[2m"   if _COLOR_ENABLED else ""
+
+
+def _parse_ver(v: str):
+    """Parse a version string into a tuple of (major, minor, patch, prerelease) for comparison."""
+    v = v.strip()
+    parts = []
+    for p in v.split("."):
+        parts.append(int(''.join(c for c in p if c.isdigit()) or '0'))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
 
 # ============================================================
 # CONFIGURATION PATHS
@@ -38,6 +71,8 @@ INDEX_FILE  = CACHE_DIR / "index.json"
 BIN_DIR     = Path("/usr/local/bin")
 ROOT_DIR    = Path("/")
 
+LOCK_FILE   = DATA_DIR / "yapm.lock"
+
 def set_root_dir(root_str: str):
     global ROOT_DIR, INSTALL_DIR, DB_FILE, BIN_DIR
     ROOT_DIR = Path(root_str).resolve()
@@ -45,7 +80,7 @@ def set_root_dir(root_str: str):
         return
     INSTALL_DIR = ROOT_DIR / "var/lib/yapm/packages"
     DB_FILE = ROOT_DIR / "var/lib/yapm/installed.json"
-    BIN_DIR = ROOT_DIR / "usr/local/bin"
+    BIN_DIR = ROOT_DIR / "usr/bin"
 
 YAPM_CONF_SYSTEM = Path("/etc/yapm/yapm.conf")
 YAPM_CONF_USER   = Path.home() / ".config" / "yapm" / "yapm.conf"
@@ -69,7 +104,6 @@ DEFAULT_CONFIG = {
         {"url": "https://archive.ubuntu.com/ubuntu/", "priority": 10},
         {"url": "https://deb.debian.org/debian/", "priority": 20},
         {"url": "https://mirror.rackspace.com/archlinux/", "priority": 30},
-        {"url": "https://mirrors.fedoraproject.org/", "priority": 40},
         {"url": "https://yapm.pages.dev/", "priority": 50}
     ]
 }
@@ -81,17 +115,67 @@ def require_root():
         print("  Try: sudo yapm <command>")
         sys.exit(1)
 
+
+def check_deps():
+    """Check that required external tools are available."""
+    missing = []
+    for cmd in ("zstd", "tar"):
+        if not shutil.which(cmd):
+            missing.append(cmd)
+    if missing:
+        print(f"Error: required tools not found: {', '.join(missing)}")
+        print(f"  Install them with: sudo pacman -S {' '.join(missing)}")
+        sys.exit(1)
+
+
+class _FileLock:
+    """Simple file-based lock using fcntl."""
+    def __init__(self, path):
+        self._path = path
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = open(self._path, 'a')
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except OSError:
+            self._fd.close()
+            self._fd = None
+        return self
+
+    def __exit__(self, *args):
+        if self._fd:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self._fd.close()
+
 # ============================================================
 # INITIALIZATION
 # ============================================================
 
 def ensure_dirs():
+    check_deps()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check for another running yapm instance
+    if LOCK_FILE.exists():
+        try:
+            old_pid = int(LOCK_FILE.read_text().strip())
+            os.kill(old_pid, 0)
+            print(f"Error: another yapm instance is running (pid {old_pid}).")
+            print("  If this is a mistake, remove /var/lib/yapm/yapm.lock.")
+            sys.exit(1)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # stale lock or can't check — safe to proceed
+    LOCK_FILE.write_text(str(os.getpid()))
 
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG)
@@ -108,8 +192,12 @@ def ensure_dirs():
         save_db({})
 
 def load_config() -> Dict:
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: Corrupted config file, using defaults: {e}")
+        return DEFAULT_CONFIG
 
 def save_config(config: Dict):
     with open(CONFIG_FILE, "w") as f:
@@ -149,25 +237,30 @@ def load_db() -> Dict:
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not DB_FILE.exists():
         DB_FILE.write_text("{}")
-    with open(DB_FILE) as f:
-        db = json.load(f)
-    migrated = False
-    new_db = {}
-    for k, v in db.items():
-        if "/" in k:
-            author, name = k.split("/", 1)
-            v.setdefault("metadata", {})["author"] = author
-            new_db[name] = v
-            migrated = True
-        else:
-            new_db[k] = v
-    if migrated:
-        save_db(new_db)
+    with _FileLock(DB_FILE):
+        with open(DB_FILE) as f:
+            db = json.load(f)
+        migrated = False
+        new_db = {}
+        for k, v in db.items():
+            if "/" in k:
+                author, name = k.split("/", 1)
+                v.setdefault("metadata", {})["author"] = author
+                new_db[name] = v
+                migrated = True
+            else:
+                new_db[k] = v
+        if migrated:
+            _write_db(new_db)
     return new_db
 
-def save_db(db: Dict):
+def _write_db(db: Dict):
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=4)
+
+def save_db(db: Dict):
+    with _FileLock(DB_FILE):
+        _write_db(db)
 
 # ============================================================
 # UTILITIES
@@ -202,46 +295,78 @@ def validate_mirror(url: str) -> bool:
         return False
 
 def download(url: str, desc: str = "Downloading", silent_errors: bool = False) -> Optional[bytes]:
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'yapm/1.0'})
-        with urllib.request.urlopen(req, timeout=120) as response:
-            size = int(response.headers.get('content-length', 0))
-            data = b""
-            chunk_size = 8192
-            downloaded = 0
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk: break
-                data += chunk
-                downloaded += len(chunk)
-                if size:
-                    percent = int(downloaded * 100 / size)
-                    cols, _ = shutil.get_terminal_size((80, 20))
-                    bar_len = min(40, cols - len(desc) - 30)
-                    if bar_len < 10: bar_len = 10
-                    filled = int(bar_len * downloaded / size)
-                    
-                    if filled >= bar_len:
-                        bar = "=" * bar_len
-                    else:
-                        bar = "=" * filled + ">" + " " * (bar_len - filled - 1)
+    max_retries = 5
+    chunks = []
+    downloaded = 0
+    size = 0
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'yapm/1.0'})
+            if downloaded > 0:
+                req.add_header("Range", f"bytes={downloaded}-")
+            with urllib.request.urlopen(req, timeout=120) as response:
+                if attempt == 0 or response.status != 206:
+                    chunks = []
+                    downloaded = 0
+                    size = int(response.headers.get('content-length', 0))
+                
+                chunk_size = 8192
+                interrupted = False
+                while True:
+                    try:
+                        chunk = response.read(chunk_size)
+                    except Exception:
+                        interrupted = True
+                        break
+                    if not chunk: break
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    if size:
+                        percent = int(downloaded * 100 / size)
+                        cols, _ = shutil.get_terminal_size((80, 20))
+                        bar_len = min(40, cols - len(desc) - 30)
+                        if bar_len < 10: bar_len = 10
+                        filled = int(bar_len * downloaded / size)
                         
-                    brown = "\033[38;2;160;120;90m"
-                    reset = "\033[0m"
-                    
-                    sz_str = f"{downloaded/1048576:.1f}/{size/1048576:.1f}MB" if size > 1048576 else f"{downloaded/1024:.0f}/{size/1024:.0f}KB"
-                    
-                    print(f"\r\033[K{brown}/yapm > {desc} [{bar}] {percent:3d}%{reset} \033[38;5;242m({sz_str})\033[0m", end="", flush=True)
-            print()
-            return data
-    except urllib.error.HTTPError as e:
-        if not silent_errors or e.code != 404:
-            print(f"\nError downloading {url}: {e}")
-        return None
-    except Exception as e:
-        if not silent_errors:
-            print(f"\nError downloading {url}: {e}")
-        return None
+                        if filled >= bar_len:
+                            bar = "=" * bar_len
+                        else:
+                            bar = "=" * filled + ">" + " " * (bar_len - filled - 1)
+                            
+                        brown = "\033[38;2;160;120;90m"
+                        reset = "\033[0m"
+                        
+                        sz_str = f"{downloaded/1048576:.1f}/{size/1048576:.1f}MB" if size > 1048576 else f"{downloaded/1024:.0f}/{size/1024:.0f}KB"
+                        
+                        print(f"\r\033[K{brown}/yapm > {desc} [{bar}] {percent:3d}%{reset} \033[38;5;242m({sz_str})\033[0m", end="", flush=True)
+                
+                if interrupted or (size > 0 and downloaded < size):
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                    else:
+                        print()
+                        if not silent_errors:
+                            print(f"\nDownload incomplete (got {downloaded} of {size} bytes)")
+                        return None
+                print()
+                return b"".join(chunks)
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and downloaded > 0 and downloaded >= size:
+                print()
+                return b"".join(chunks)
+            if not silent_errors or e.code != 404:
+                print(f"\nError downloading {url}: {e}")
+            if e.code in (404, 403, 401):
+                return None
+        except Exception as e:
+            if attempt == max_retries - 1:
+                if not silent_errors:
+                    print(f"\nError downloading {url}: {e}")
+                return None
+            time.sleep(1)
+            continue
+    return None
 
 def is_valid_zip(data: bytes) -> bool:
     """Check ZIP magic bytes (PK\x03\x04) or ZSTD magic bytes (28 B5 2F FD) to avoid treating HTML 404 pages as packages."""
@@ -261,6 +386,8 @@ def safe_extract(archive_path: Path, target: Path):
                 z.extractall(target)
         return
 
+    resolved_target = target.resolve()
+
     with open(archive_path, "rb") as f:
         magic = f.read(4)
         
@@ -268,8 +395,10 @@ def safe_extract(archive_path: Path, target: Path):
         with zipfile.ZipFile(archive_path) as z:
             for member in z.infolist():
                 member_path = (target / member.filename).resolve()
-                if not str(member_path).startswith(str(target.resolve())):
-                    raise Exception("Unsafe zip detected")
+                try:
+                    member_path.relative_to(resolved_target)
+                except ValueError:
+                    raise Exception("Unsafe zip detected: path traversal attempt")
                 z.extract(member, target)
                 attr = member.external_attr >> 16
                 if attr != 0:
@@ -280,8 +409,10 @@ def safe_extract(archive_path: Path, target: Path):
             with tarfile.open(tmp.name) as tar:
                 for member in tar.getmembers():
                     member_path = (target / member.name).resolve()
-                    if not str(member_path).startswith(str(target.resolve())):
-                        raise Exception("Unsafe tar detected")
+                    try:
+                        member_path.relative_to(resolved_target)
+                    except ValueError:
+                        raise Exception("Unsafe tar detected: path traversal attempt")
                     tar.extract(member, target)
     else:
         raise Exception("Unknown archive format")
@@ -314,15 +445,14 @@ def parse_pkginfo(data: bytes) -> dict:
                                     result[k] = v
                 except KeyError:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to parse .PKGINFO: {e}")
     return result
 
 def parse_yapm_data(content: str) -> dict:
     data = {"METADATA": {}, "CONTENT": {}, "FILES": {}}
     current_section = None
     
-    import re
     # Strip multi-line comments /* ... */
     content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
     
@@ -345,7 +475,6 @@ def parse_yapm_data(content: str) -> dict:
             val = parts[1].strip()
             
             if val.startswith('[') and val.endswith(']'):
-                import ast
                 try:
                     val = ast.literal_eval(val)
                 except Exception:
@@ -414,12 +543,15 @@ def extract_deb(data: bytes, target: Path):
             f.write(data)
         try:
             print("  Extracting DEB container...")
-            subprocess.run(["ar", "x", "pkg.deb"], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ar", "x", "pkg.deb"], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             for f in Path(td).iterdir():
                 if f.name.startswith("data.tar"):
                     print("  Extracting DEB data payload...")
-                    subprocess.run(["tar", "-xf", f.name, "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["tar", "-xf", f.name, "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
                     break
+        except subprocess.CalledProcessError as e:
+            print(f"Error extracting DEB package: {e}\nStderr: {e.stderr}")
+            raise
         except Exception as e:
             print(f"Error extracting DEB package: {e}")
             raise
@@ -431,10 +563,43 @@ def extract_arch(data: bytes, target: Path):
             f.write(data)
         try:
             print("  Extracting Arch ZSTD container...")
-            subprocess.run(["tar", "--use-compress-program=zstd", "-xf", "pkg.tar.zst", "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["tar", "--use-compress-program=zstd", "-xf", "pkg.tar.zst", "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error extracting Arch package: {e}\nStderr: {e.stderr}")
+            raise
         except Exception as e:
             print(f"Error extracting Arch package: {e}")
             raise
+
+def get_arch_file_list(data: bytes) -> List[str]:
+    """Extract the list of file paths from an Arch .pkg.tar.zst without fully extracting."""
+    with tempfile.TemporaryDirectory() as td:
+        pkg_path = Path(td) / "pkg.tar.zst"
+        pkg_path.write_bytes(data)
+        tar_path = Path(td) / "pkg.tar"
+        try:
+            subprocess.run(["zstd", "-d", "-f", str(pkg_path), "-o", str(tar_path)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with tarfile.open(tar_path) as tar:
+                return [m.name for m in tar.getmembers() if m.isfile() or m.issym() or m.islnk()]
+        except Exception:
+            return []
+
+def get_deb_file_list(data: bytes) -> List[str]:
+    """Extract the list of file paths from a .deb without fully extracting."""
+    with tempfile.TemporaryDirectory() as td:
+        deb_path = Path(td) / "pkg.deb"
+        deb_path.write_bytes(data)
+        try:
+            subprocess.run(["ar", "x", "pkg.deb"], cwd=td, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for f in Path(td).iterdir():
+                if f.name.startswith("data.tar"):
+                    with tarfile.open(f) as tar:
+                        return [m.name for m in tar.getmembers() if m.isfile() or m.issym() or m.islnk()]
+        except Exception:
+            pass
+    return []
 
 def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
     with tempfile.TemporaryDirectory() as td:
@@ -455,7 +620,10 @@ def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
         script = f"source /tmp/yapm_install_hook.sh && if type {phase} >/dev/null 2>&1; then {phase}; fi"
         print(f"  Running {phase} hook...")
         if str(root) != "/":
-            subprocess.run(["arch-chroot", str(root), "bash", "-c", script], check=False)
+            if not shutil.which("arch-chroot"):
+                print(f"  Warning: arch-chroot not found, skipping {phase} hook.")
+            else:
+                subprocess.run(["arch-chroot", str(root), "bash", "-c", script], check=False)
         else:
             subprocess.run(["bash", "-c", script], check=False)
         tmp_hook.unlink(missing_ok=True)
@@ -464,8 +632,20 @@ def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
 # PACKAGE LOGIC
 # ============================================================
 
+_UBUNTU_DISTROS = ["noble", "jammy", "focal", "bionic"]
+_DEBIAN_DISTROS = ["trixie", "bookworm", "bullseye", "buster"]
+
+def _detect_deb_distro(mirror_url: str) -> str:
+    """Detect the appropriate Debian/Ubuntu distro codename from a mirror URL."""
+    if "ubuntu" in mirror_url:
+        for d in _UBUNTU_DISTROS:
+            return d  # Use first (newest) for now; could probe mirror later
+    for d in _DEBIAN_DISTROS:
+        return d
+    return "bookworm"
+
 def parse_debian_index(mirror_url: str, merged_index: dict):
-    dist = "jammy" if "ubuntu" in mirror_url else "bookworm"
+    dist = _detect_deb_distro(mirror_url)
     url = normalize(mirror_url) + f"dists/{dist}/main/binary-amd64/Packages.gz"
     data = download(url, desc=f"Fetching Debian index from {mirror_url}")
     if not data: return
@@ -496,7 +676,7 @@ def parse_debian_index(mirror_url: str, merged_index: dict):
         print(f"Error parsing Debian index: {e}")
 
 def parse_arch_index(mirror_url: str, merged_index: dict):
-    for repo in ("core", "extra"):
+    for repo in ("core", "extra", "community"):
         url = normalize(mirror_url) + f"{repo}/os/x86_64/{repo}.db"
         data = download(url, desc=f"Fetching Arch {repo} index from {mirror_url}")
         if not data:
@@ -635,15 +815,20 @@ def load_index() -> Dict:
     new_pkgs = {}
     for k, v in idx.get("packages", {}).items():
         name = k.split("/", 1)[-1] if "/" in k else k
-        if name in new_pkgs:
-            continue
-        # Convert old flat entries (e.g. {"version": …, "format": "deb"})
-        # to the new nested-by-format format {fmt: entry_dict}.
+        # Normalize to nested-by-format structure
         if any(fmt in v for fmt in ("yapm", "arch", "deb")):
-            new_pkgs[name] = v          # already new format
+            normalized = v
         else:
             fmt = v.get("format", "yapm")
-            new_pkgs[name] = {fmt: v}   # wrap old flat entry
+            normalized = {fmt: v}
+        
+        if name in new_pkgs:
+            # Merge: add any format sub-entries not already present
+            for fmt, entry in normalized.items():
+                if fmt not in new_pkgs[name]:
+                    new_pkgs[name][fmt] = entry
+        else:
+            new_pkgs[name] = dict(normalized)
     idx["packages"] = new_pkgs
     return idx
 
@@ -708,23 +893,23 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
             return data
     return None
 
-def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], path: set, version: Optional[str] = None, arch_mode: bool = False):
-    if pkg in to_install or pkg in db or pkg in VIRTUAL_PROVIDERS:
+def resolve_dependencies(pkg: str, idx: Dict, db: Dict, to_install: List[str], path: set, visited: set, version: Optional[str] = None, arch_mode: bool = False):
+    if pkg in to_install or pkg in db or pkg in VIRTUAL_PROVIDERS or pkg in visited:
         return
     if pkg in path:
         print(f"Error: Circular dependency detected: {' -> '.join(path)} -> {pkg}")
         sys.exit(1)
 
     path.add(pkg)
+    visited.add(pkg)
     pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
     if pkg_info:
         for dep in pkg_info.get("dependencies", []):
-            import re
             if dep in VIRTUAL_PROVIDERS:
                 continue
             if re.match(r'^lib.*\.so', dep) or re.search(r'\.so(\.[0-9]+)*$', dep):
                 continue
-            resolve_dependencies(dep, idx, db, to_install, path, arch_mode=arch_mode)
+            resolve_dependencies(dep, idx, db, to_install, path, visited, arch_mode=arch_mode)
         to_install.append(pkg)
     else:
         if arch_mode:
@@ -738,22 +923,32 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
         print("yapm.nativenationality is enabled — only native .yapm packages allowed")
         sys.exit(1)
 
-    target = INSTALL_DIR / pkg_name
-    if target.exists():
-        shutil.rmtree(target)
-    target.mkdir(parents=True, exist_ok=True)
+    # Determine extraction target:
+    # - .yapm packages always go to sandbox (they have manifests)
+    # - arch/deb extract to ROOT_DIR when --root is set (respect native prefix)
+    # - arch/deb stay in sandbox when running on host (safety)
+    use_root = fmt in ("arch", "deb") and str(ROOT_DIR) != "/"
+    file_list: List[str] = []
+
+    if use_root:
+        extract_target = ROOT_DIR
+    else:
+        extract_target = INSTALL_DIR / pkg_name
+        if extract_target.exists():
+            shutil.rmtree(extract_target)
+        extract_target.mkdir(parents=True, exist_ok=True)
 
     try:
         if fmt == "yapm":
             tmp = tempfile.NamedTemporaryFile(delete=False)
             tmp.write(data)
             tmp.close()
-            safe_extract(Path(tmp.name), target)
+            safe_extract(Path(tmp.name), extract_target)
             os.unlink(tmp.name)
         elif fmt == "deb":
-            extract_deb(data, target)
+            extract_deb(data, extract_target)
         elif fmt == "arch":
-            extract_arch(data, target)
+            extract_arch(data, extract_target)
     except Exception as e:
         print(f"Installation failed: {e}")
         sys.exit(1)
@@ -761,66 +956,123 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     pkg_meta = {"version": "0.0.0", "dependencies": [], "format": fmt}
 
-    yapm_data_path = target / "yapm.data"
-    if yapm_data_path.exists():
-        with open(yapm_data_path) as f:
-            y_data = parse_yapm_data(f.read())
-            
-        # Metadata
-        meta = y_data.get("METADATA", {})
-        pkg_meta["version"] = meta.get("version", "0.0.0")
-        if "description" in meta: pkg_meta["description"] = meta["description"]
-        if "dependencies" in meta: pkg_meta["dependencies"] = meta["dependencies"]
-        
-        content_info = y_data.get("CONTENT", {})
-        
-        # BuildFile
-        build_file = content_info.get("BuildFile")
-        if build_file and (target / build_file).exists():
-            print(f"  Running build script: {build_file}...")
-            os.chmod(target / build_file, 0o755)
-            subprocess.run([str(target / build_file)], cwd=target, check=True)
-            
-        # PreInstall
-        pre_install = content_info.get("PreInstall")
-        if pre_install and (target / pre_install).exists():
-            print("  Running pre-install script...")
-            os.chmod(target / pre_install, 0o755)
-            subprocess.run([str(target / pre_install)], cwd=target, check=True)
-            
-        # File Mappings
-        files_info = y_data.get("FILES", {})
-        for src, dest in files_info.items():
-            src_path = target / src
-            dest_path = Path(dest)
-            if src_path.exists():
-                print(f"  Mapping file: {src} -> {dest}")
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                if dest_path.exists() or dest_path.is_symlink():
-                    os.unlink(dest_path)
-                shutil.copy2(src_path, dest_path)
-                chaos_yap_on_extract(src)
+    if fmt == "yapm":
+        # .yapm packages use manifest-driven installation
+        yapm_data_path = extract_target / "yapm.data"
+        if yapm_data_path.exists():
+            with open(yapm_data_path) as f:
+                y_data = parse_yapm_data(f.read())
                 
-        # RunFile
-        run_file = content_info.get("RunFile")
-        if run_file and (target / run_file).exists():
-            dest = BIN_DIR / Path(run_file).name
-            if dest.exists() or dest.is_symlink():
-                os.unlink(dest)
-            os.chmod(target / run_file, 0o755)
-            os.symlink(Path("/") / (target / run_file).relative_to(ROOT_DIR), dest)
-            print(f"  Linked executable {Path(run_file).name} -> {dest}")
-            chaos_yap_on_extract(run_file)
+            meta = y_data.get("METADATA", {})
+            pkg_meta["version"] = meta.get("version", "0.0.0")
+            if "description" in meta: pkg_meta["description"] = meta["description"]
+            if "dependencies" in meta: pkg_meta["dependencies"] = meta["dependencies"]
             
-        # PostInstall
-        post_install = content_info.get("PostInstall")
-        if post_install and (target / post_install).exists():
-            print("  Running post-install script...")
-            os.chmod(target / post_install, 0o755)
-            subprocess.run([str(target / post_install)], cwd=target, check=True)
+            content_info = y_data.get("CONTENT", {})
+            
+            build_file = content_info.get("BuildFile")
+            if build_file and (extract_target / build_file).exists():
+                print(f"  Running build script: {build_file}...")
+                os.chmod(extract_target / build_file, 0o755)
+                subprocess.run([str(extract_target / build_file)], cwd=extract_target, check=True)
+                
+            pre_install = content_info.get("PreInstall")
+            if pre_install and (extract_target / pre_install).exists():
+                print("  Running pre-install script...")
+                os.chmod(extract_target / pre_install, 0o755)
+                subprocess.run([str(extract_target / pre_install)], cwd=extract_target, check=True)
+                
+            # File Mappings — root absolute destinations at ROOT_DIR
+            files_info = y_data.get("FILES", {})
+            for src, dest in files_info.items():
+                src_path = extract_target / src
+                if dest.startswith("/"):
+                    dest_path = ROOT_DIR / dest.lstrip("/")
+                else:
+                    dest_path = extract_target / dest
+                if src_path.exists():
+                    print(f"  Mapping file: {src} -> {dest}")
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    if dest_path.exists() or dest_path.is_symlink():
+                        os.unlink(dest_path)
+                    shutil.copy2(src_path, dest_path)
+                    chaos_yap_on_extract(src)
+                    
+            run_file = content_info.get("RunFile")
+            if run_file and (extract_target / run_file).exists():
+                dest = BIN_DIR / Path(run_file).name
+                if dest.exists() or dest.is_symlink():
+                    os.unlink(dest)
+                os.chmod(extract_target / run_file, 0o755)
+                symlink_src = ROOT_DIR / (extract_target / run_file).relative_to(ROOT_DIR)
+                os.symlink(symlink_src, dest)
+                print(f"  Linked executable {Path(run_file).name} -> {dest}")
+                chaos_yap_on_extract(run_file)
+                
+            post_install = content_info.get("PostInstall")
+            if post_install and (extract_target / post_install).exists():
+                print("  Running post-install script...")
+                os.chmod(extract_target / post_install, 0o755)
+                subprocess.run([str(extract_target / post_install)], cwd=extract_target, check=True)
+        else:
+            # Fallback for .yapm without manifest
+            bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
+            for src_dir in bin_source_dirs:
+                if src_dir.exists() and src_dir.is_dir():
+                    for item in src_dir.iterdir():
+                        if item.is_file() and os.access(item, os.X_OK):
+                            dest = BIN_DIR / item.name
+                            if dest.exists() or dest.is_symlink():
+                                os.unlink(dest)
+                            symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                            os.symlink(symlink_src, dest)
+                            print(f"  Linked {item.name} -> {dest}")
+
+            metadata_path = extract_target / "metadata.json"
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path) as f:
+                        pkg_meta.update(json.load(f))
+                except Exception:
+                    pass
+    elif use_root:
+        # arch/deb extracted to ROOT_DIR — track installed files
+        if fmt == "arch":
+            file_list = get_arch_file_list(data)
+        else:
+            file_list = get_deb_file_list(data)
+
+        # Extract metadata from the package
+        if fmt == "arch":
+            pkginfo = parse_pkginfo(data)
+            if pkginfo:
+                pkg_meta["version"] = pkginfo.get("pkgver", "0.0.0")
+                pkg_meta["dependencies"] = pkginfo.get("depends", [])
+                pkg_meta["description"] = pkginfo.get("pkgdesc", "")
+        elif fmt == "deb":
+            # Try to extract version from control
+            with tempfile.TemporaryDirectory() as td:
+                deb_path = Path(td) / "pkg.deb"
+                deb_path.write_bytes(data)
+                try:
+                    subprocess.run(["ar", "x", "pkg.deb"], cwd=td, check=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for f in Path(td).iterdir():
+                        if f.name.startswith("control"):
+                            with open(f) as fh:
+                                for line in fh:
+                                    if line.startswith("Version: "):
+                                        pkg_meta["version"] = line.split(":", 1)[1].strip()
+                                    elif line.startswith("Depends: "):
+                                        dep_str = line.split(":", 1)[1].strip()
+                                        pkg_meta["dependencies"] = [d.strip().split()[0] for d in dep_str.split(",")]
+                                    elif line.startswith("Description: "):
+                                        pkg_meta["description"] = line.split(":", 1)[1].strip()
+                except Exception:
+                    pass
     else:
-        # Fallback to simple extraction linking
-        bin_source_dirs = [target / "src", target / "usr" / "bin", target / "bin"]
+        # arch/deb in sandbox mode (running on host) — fallback linking
+        bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
         for src_dir in bin_source_dirs:
             if src_dir.exists() and src_dir.is_dir():
                 for item in src_dir.iterdir():
@@ -828,10 +1080,11 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                         dest = BIN_DIR / item.name
                         if dest.exists() or dest.is_symlink():
                             os.unlink(dest)
-                        os.symlink(Path("/") / item.relative_to(ROOT_DIR), dest)
+                        symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                        os.symlink(symlink_src, dest)
                         print(f"  Linked {item.name} -> {dest}")
 
-        metadata_path = target / "metadata.json"
+        metadata_path = extract_target / "metadata.json"
         if metadata_path.exists():
             try:
                 with open(metadata_path) as f:
@@ -839,17 +1092,21 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             except Exception:
                 pass
 
-    db[pkg_name] = {
+    db_entry = {
         "version": pkg_meta.get("version", "0.0.0"),
-        "path": str(target),
+        "path": str(extract_target),
         "dependencies": pkg_meta.get("dependencies", []),
         "format": fmt,
         "metadata": pkg_meta
     }
+    if use_root and file_list:
+        db_entry["files"] = file_list
+
+    db[pkg_name] = db_entry
 
     save_db(db)
 
-def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False):
+def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False, dry_run: bool = False):
     if config_flag("yapm.yapm"):
         chaos_spinner(3)
     if config_flag("yapm.autoupdate"):
@@ -883,6 +1140,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
     pre_fetched_data = {}
     to_install_merged = []
     seen = set()
+    visited = set()
     pin_version = {}
     pin_mirror = {}
 
@@ -957,7 +1215,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
 
         pin_version[pkg_name] = pkg_version
         pin_mirror[pkg_name] = pkg_pinned_mirror
-        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, version=pkg_version, arch_mode=arch_mode)
+        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, visited, version=pkg_version, arch_mode=arch_mode)
 
     for pkg_path in local_installs:
         local_fmt = fmt
@@ -1010,6 +1268,10 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
             print("\nAborted.")
             sys.exit(0)
 
+    if dry_run:
+        print("(dry run — no changes made)")
+        return
+
     for p in to_install_merged:
         p_ver = pin_version.get(p)
         p_mirror = pin_mirror.get(p)
@@ -1058,7 +1320,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
 
     chaos_post_operation()
 
-def remove_package(pkg: str):
+def remove_package(pkg: str, noconfirm: bool = False):
     db = load_db()
 
     pkg_key = pkg
@@ -1067,23 +1329,67 @@ def remove_package(pkg: str):
         print(f"Package '{pkg_key}' not installed.")
         return
 
-    target = Path(db[pkg_key]["path"])
-    bin_source_dirs = [target / "src", target / "usr" / "bin", target / "bin"]
-    
-    for src_dir in bin_source_dirs:
-        if src_dir.exists() and src_dir.is_dir():
-            for item in src_dir.iterdir():
-                dest = BIN_DIR / item.name
-                if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
-                    os.unlink(dest)
-                    print(f"Removed link {dest}")
+    if not noconfirm and not config_flag("yapm.noconfirm"):
+        try:
+            choice = input(f"Remove {format_key(pkg_key)}? [y/N] ").strip().lower()
+            if choice not in ('y', 'yes'):
+                print("Aborted.")
+                return
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
 
-    shutil.rmtree(db[pkg_key]["path"], ignore_errors=True)
+    pkg_info = db[pkg_key]
+    file_list = pkg_info.get("files", [])
+
+    if file_list:
+        # File-list-based removal (packages extracted to ROOT_DIR)
+        root_ref = Path(pkg_info.get("path", "/"))
+        removed = 0
+        for f in file_list:
+            full_path = root_ref / f
+            if full_path.is_symlink() or full_path.is_file():
+                os.unlink(full_path)
+                removed += 1
+            elif full_path.is_dir():
+                try:
+                    full_path.rmdir()  # only removes empty dirs
+                except OSError:
+                    pass  # non-empty, leave it
+        # Clean up empty parent dirs left behind
+        dirs_to_check = set()
+        for f in file_list:
+            p = (root_ref / f).parent
+            while p != root_ref and p != root_ref.parent:
+                dirs_to_check.add(p)
+                p = p.parent
+        for d in sorted(dirs_to_check, reverse=True):
+            try:
+                if d.exists() and not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                pass
+        print(f"Removed {format_key(pkg_key)} ({removed} files).")
+    else:
+        # Directory-based removal (sandbox packages)
+        target = Path(pkg_info["path"])
+        bin_source_dirs = [target / "src", target / "usr" / "bin", target / "bin"]
+        
+        for src_dir in bin_source_dirs:
+            if src_dir.exists() and src_dir.is_dir():
+                for item in src_dir.iterdir():
+                    dest = BIN_DIR / item.name
+                    if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
+                        os.unlink(dest)
+                        print(f"Removed link {dest}")
+
+        shutil.rmtree(target, ignore_errors=True)
+        print(f"Removed {format_key(pkg_key)}.")
+
     del db[pkg_key]
     save_db(db)
-    print(f"Removed {format_key(pkg_key)}.")
 
-def upgrade_packages(refresh: bool = False):
+def upgrade_packages(refresh: bool = False, dry_run: bool = False):
     if refresh or config_flag("yapm.autoupdate"):
         update_index()
     db = load_db()
@@ -1103,7 +1409,7 @@ def upgrade_packages(refresh: bool = False):
             remote_ver = remote_info.get("latest", "0.0.0")
         else:
             remote_ver = remote_info.get("version", "0.0.0")
-        if remote_ver > local_ver:
+        if _parse_ver(remote_ver) > _parse_ver(local_ver):
             to_upgrade.append((pkg, remote_ver))
 
     if not to_upgrade:
@@ -1113,6 +1419,10 @@ def upgrade_packages(refresh: bool = False):
     print("The following packages will be upgraded:")
     for pkg, ver in to_upgrade:
         print(f"  {pkg} ({db[pkg].get('version', '0.0.0')} -> {ver})")
+
+    if dry_run:
+        print("(dry run — no changes made)")
+        return
 
     for pkg, ver in to_upgrade:
         chaos_interrupt()
@@ -1126,11 +1436,58 @@ def upgrade_packages(refresh: bool = False):
 
     chaos_post_operation()
 
-def list_installed():
+def init_package(noconfirm: bool = False, root: Optional[str] = None):
+    """Bootstrap a Riot system by ensuring bash is installed."""
+    if not config_flag("yapm.riot"):
+        print("Error: yapm init requires yapm.riot to be enabled.")
+        print("  Run: yapm config enable yapm.riot")
+        sys.exit(1)
+
+    db = load_db()
+    if "bash" in db:
+        print("bash is already installed.")
+        return
+
+    print("Bootstrapping system: installing bash...")
+    install_package(["bash"], fmt="yapm", noconfirm=True, root=root)
+    print("bash installed. Shell is ready.")
+
+def list_installed(outdated: bool = False, json_output: bool = False):
     db = load_db()
     if not db:
-        print("No packages installed.")
+        if json_output:
+            print("[]")
+        else:
+            print("No packages installed.")
         return
+
+    if json_output:
+        print(json.dumps(db, indent=2))
+        return
+
+    if outdated:
+        idx = load_index()
+        found = False
+        for pkg, info in db.items():
+            local_ver = info.get("version", "0.0.0")
+            installed_fmt = info.get("format", "yapm")
+            formats_entry = idx.get("packages", {}).get(pkg)
+            if not formats_entry:
+                continue
+            remote_info = formats_entry.get(installed_fmt)
+            if not remote_info:
+                continue
+            if "versions" in remote_info:
+                remote_ver = remote_info.get("latest", "0.0.0")
+            else:
+                remote_ver = remote_info.get("version", "0.0.0")
+            if _parse_ver(remote_ver) > _parse_ver(local_ver):
+                print(f"  {pkg} {Color.YELLOW}{local_ver}{Color.RESET} -> {Color.GREEN}{remote_ver}{Color.RESET}")
+                found = True
+        if not found:
+            print("Everything is up to date.")
+        return
+
     for pkg, info in db.items():
         ver = info.get("version", "0.0.0")
         fmt = info.get("format", "yapm")
@@ -1154,7 +1511,6 @@ def uninstall_yapm():
 YAPM_SOURCE_URL = "https://raw.githubusercontent.com/commodorial64/yapm/main/yapm.py"
 
 def update_yapm(force: bool = False):
-    import re
     print(f"Fetching latest yapm from {YAPM_SOURCE_URL} ...")
     data = download(YAPM_SOURCE_URL, desc="Downloading yapm")
     if not data:
@@ -1173,11 +1529,11 @@ def update_yapm(force: bool = False):
     print(f"  Installed : {APP_VERSION}")
     print(f"  Available : {new_ver}")
 
-    if not force and new_ver == APP_VERSION:
+    if not force and _parse_ver(new_ver) == _parse_ver(APP_VERSION):
         print("yapm is already up to date.")
         return
 
-    if not force and new_ver < APP_VERSION:
+    if not force and _parse_ver(new_ver) < _parse_ver(APP_VERSION):
         print("Downloaded version is older than installed. Use --force to override.")
         return
 
@@ -1236,6 +1592,7 @@ def info_package(pkg: str):
 
 def search_package(term: str):
     idx = load_index()
+    db = load_db()
     found = False
     term_lower = term.lower()
 
@@ -1256,33 +1613,175 @@ def search_package(term: str):
             desc = ver_info.get("description", "").lower()
 
             if term_lower in display_lower or term_lower in desc:
-                print(f"{display} (v{latest_ver}) - {ver_info.get('description', 'No description')}")
+                installed_mark = ""
+                if pkg_key in db:
+                    local_ver = db[pkg_key].get("version", "?")
+                    installed_mark = f" {Color.GREEN}[installed {local_ver}]{Color.RESET}"
+                print(f"{display} (v{latest_ver}) - {ver_info.get('description', 'No description')}{installed_mark}")
                 found = True
                 break
 
     if not found:
         print("No matches found in local index. Try 'yapm update' first.")
 
+# ============================================================
+# QOL COMMANDS
+# ============================================================
+
+def outdated_packages():
+    """Show installed packages that have newer versions available."""
+    db = load_db()
+    idx = load_index()
+    found = False
+
+    for pkg, info in db.items():
+        local_ver = info.get("version", "0.0.0")
+        installed_fmt = info.get("format", "yapm")
+        formats_entry = idx.get("packages", {}).get(pkg)
+        if not formats_entry:
+            continue
+        remote_info = formats_entry.get(installed_fmt)
+        if not remote_info:
+            continue
+        if "versions" in remote_info:
+            remote_ver = remote_info.get("latest", "0.0.0")
+        else:
+            remote_ver = remote_info.get("version", "0.0.0")
+        if _parse_ver(remote_ver) > _parse_ver(local_ver):
+            print(f"  {pkg} {Color.YELLOW}{local_ver}{Color.RESET} -> {Color.GREEN}{remote_ver}{Color.RESET}")
+            found = True
+
+    if not found:
+        print("Everything is up to date.")
+
+
+def list_files(pkg: str):
+    """List files installed by a package."""
+    db = load_db()
+    if pkg not in db:
+        print(f"Package '{pkg}' is not installed.")
+        sys.exit(1)
+
+    info = db[pkg]
+    file_list = info.get("files", [])
+    if file_list:
+        for f in sorted(file_list):
+            print(f)
+    else:
+        target = Path(info.get("path", ""))
+        if target.exists():
+            for root, dirs, files in os.walk(target):
+                for f in sorted(files):
+                    print(str(Path(root).joinpath(f).relative_to(target)))
+        else:
+            print("No files found.")
+
+
+def why_package(pkg: str):
+    """Show which installed packages depend on the given package."""
+    db = load_db()
+    if pkg not in db:
+        print(f"Package '{pkg}' is not installed.")
+        sys.exit(1)
+
+    dependents = []
+    for name, info in db.items():
+        if name == pkg:
+            continue
+        deps = info.get("dependencies", [])
+        if pkg in deps:
+            dependents.append(name)
+
+    if dependents:
+        print(f"Package '{pkg}' is required by:")
+        for d in sorted(dependents):
+            print(f"  {d}")
+    else:
+        print(f"No installed packages depend on '{pkg}'.")
+
+
+def clean_cache():
+    """Remove all cached index and download files."""
+    if not CACHE_DIR.exists():
+        print("Cache is already clean.")
+        return
+    size = sum(f.stat().st_size for f in CACHE_DIR.rglob("*") if f.is_file())
+    shutil.rmtree(CACHE_DIR)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Cache cleaned ({size / 1024:.1f} KB freed).")
+
+
+def mirror_test():
+    """Test all mirrors without removing unreachable ones."""
+    config = load_config()
+    print("Testing mirrors...")
+    for m in config["mirrors"]:
+        ok = validate_mirror(m["url"])
+        status = f"{Color.GREEN}OK{Color.RESET}" if ok else f"{Color.RED}FAILED{Color.RESET}"
+        print(f"  {m['url']} -> {status}")
+
+
+def repair_package(pkg: str):
+    """Re-create missing symlinks for an installed package."""
+    db = load_db()
+    if pkg not in db:
+        print(f"Package '{pkg}' is not installed.")
+        sys.exit(1)
+
+    info = db[pkg]
+    target = Path(info.get("path", ""))
+    if not target.exists():
+        print(f"Error: package directory {target} does not exist.")
+        sys.exit(1)
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    fixed = 0
+    bin_source_dirs = [target / "src", target / "usr" / "bin", target / "bin"]
+    for src_dir in bin_source_dirs:
+        if src_dir.exists() and src_dir.is_dir():
+            for item in src_dir.iterdir():
+                if item.is_file() and os.access(item, os.X_OK):
+                    dest = BIN_DIR / item.name
+                    symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                    if not dest.exists():
+                        os.symlink(symlink_src, dest)
+                        print(f"  Created symlink {item.name} -> {dest}")
+                        fixed += 1
+
+    if fixed:
+        print(f"Repaired {fixed} missing symlinks for {pkg}.")
+    else:
+        print(f"No missing symlinks for {pkg}.")
+
+
 def build_package(directory: str):
+    """Build a .yapm package from a source directory."""
     source_dir = Path(directory)
     if not source_dir.exists() or not source_dir.is_dir():
         print(f"Error: Directory '{directory}' does not exist.")
         sys.exit(1)
-        
+
     yapm_data_path = source_dir / "yapm.data"
     if not yapm_data_path.exists():
         print(f"Error: No yapm.data found in '{directory}'. Cannot build package.")
         sys.exit(1)
-        
+
     with open(yapm_data_path) as f:
         y_data = parse_yapm_data(f.read())
-        
-    name = y_data.get("METADATA", {}).get("name", source_dir.name)
-    version = y_data.get("METADATA", {}).get("version", "0.0.0")
-    
+
+    meta = y_data.get("METADATA", {})
+    required = ["name", "version", "description", "author", "license"]
+    missing = [f for f in required if not meta.get(f)]
+    if missing:
+        print(f"Error: yapm.data is missing required fields: {', '.join(missing)}")
+        sys.exit(1)
+
+    name = meta["name"]
+    version = meta["version"]
+
     out_file = f"{name}-{version}.yapm"
     print(f"Building {out_file} from {directory}...")
-    
+
     with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
         with tarfile.open(tmp.name, 'w') as tar:
             for root, dirs, files in os.walk(source_dir):
@@ -1290,7 +1789,7 @@ def build_package(directory: str):
                     file_path = Path(root) / file
                     arcname = file_path.relative_to(source_dir)
                     tar.add(file_path, arcname=arcname)
-                    
+
         subprocess.run(["zstd", "-f", "-19", tmp.name, "-o", out_file], check=True, stdout=subprocess.DEVNULL)
 
     sudo_uid = os.environ.get('SUDO_UID')
@@ -1300,7 +1799,7 @@ def build_package(directory: str):
             os.chown(out_file, int(sudo_uid), int(sudo_gid))
         except Exception:
             pass
-            
+
     print(f"Success! Package built: {out_file}")
 
 # ============================================================
@@ -1308,6 +1807,96 @@ def build_package(directory: str):
 # ============================================================
 
 HIDDEN_FLAGS = {"yapm.yapm"}
+
+YAPM_CONTRIB_REPO = "commodorial64/yapm-contrib"
+
+def submit_package(package_path: str):
+    """Submit a .yapm package to the yapm-contrib repo via a GitHub PR."""
+    pkg = Path(package_path).resolve()
+    if not pkg.exists():
+        print(f"Error: {pkg} does not exist.")
+        sys.exit(1)
+    if not pkg.name.endswith(".yapm"):
+        print(f"Error: {pkg.name} is not a .yapm file.")
+        sys.exit(1)
+
+    # validate it's a valid tar.zst
+    with open(pkg, "rb") as f:
+        magic = f.read(4)
+    if magic != b'\x28\xb5\x2f\xfd':
+        print(f"Error: {pkg.name} is not a valid tar.zst archive.")
+        sys.exit(1)
+
+    # check yapm.data exists inside
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run(["zstd", "-d", "-f", str(pkg), "-o", f"{td}/pkg.tar"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with tarfile.open(f"{td}/pkg.tar") as tar:
+                names = [n.split("/")[-1] for n in tar.getnames()]
+                if "yapm.data" not in names:
+                    print(f"Error: {pkg.name} is missing yapm.data.")
+                    sys.exit(1)
+    except Exception as e:
+        print(f"Error validating package: {e}")
+        sys.exit(1)
+
+    # check gh is available and authenticated
+    if not shutil.which("gh"):
+        print("Error: 'gh' CLI is required. Install it from https://cli.github.com/")
+        sys.exit(1)
+    try:
+        subprocess.run(["gh", "auth", "status"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print("Error: not logged into GitHub. Run 'gh auth login' first.")
+        sys.exit(1)
+
+    branch = f"submit-{pkg.stem}"
+    tmpdir = tempfile.mkdtemp()
+
+    try:
+        print("Forking yapm-contrib...")
+        subprocess.run(["gh", "repo", "fork", YAPM_CONTRIB_REPO, "--clone=false"],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        # get fork owner
+        result = subprocess.run(["gh", "api", "user", "--jq", ".login"],
+                                capture_output=True, text=True, check=True)
+        fork_owner = result.stdout.strip()
+        fork_url = f"https://github.com/{fork_owner}/yapm-contrib.git"
+
+        print(f"Cloning fork ({fork_owner}/yapm-contrib)...")
+        subprocess.run(["git", "clone", fork_url, tmpdir], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        subprocess.run(["git", "checkout", "-b", branch], cwd=tmpdir, check=True,
+                       stdout=subprocess.DEVNULL)
+
+        shutil.copy2(pkg, tmpdir)
+        subprocess.run(["git", "add", pkg.name], cwd=tmpdir, check=True)
+        subprocess.run(["git", "commit", "-m", f"add {pkg.stem}"], cwd=tmpdir, check=True)
+
+        print(f"Pushing branch '{branch}'...")
+        subprocess.run(["git", "push", "-u", "origin", branch], cwd=tmpdir, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        print("Opening PR...")
+        result = subprocess.run(
+            ["gh", "pr", "create",
+             "--repo", YAPM_CONTRIB_REPO,
+             "--title", f"add {pkg.stem}",
+             "--body", f"Submit `{pkg.name}` to yapm-contrib."],
+            cwd=tmpdir, capture_output=True, text=True, check=True
+        )
+        print(result.stdout.strip())
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 def yapm_config_list():
     conf = load_yapm_conf()
@@ -1345,9 +1934,6 @@ def yapm_config_disable(flag: str):
 # CHAOS MODE
 # ============================================================
 
-import random
-import time
-
 CHAOS_THROWBACKS = [
     "yapm? more like yap",
     "WARNING: yapm may conflict with your will to live",
@@ -1380,7 +1966,6 @@ def chaos_delay(seconds=0.5):
     time.sleep(seconds)
 
 def chaos_spinner(seconds=3):
-    import itertools
     spinner = itertools.cycle(["|", "/", "-", "\\"])
     for _ in range(int(seconds * 10)):
         sys.stdout.write(f"\rthinking... {next(spinner)}")
@@ -1481,6 +2066,8 @@ def main():
                            help="Install to a different root directory (requires yapm.insroot)")
     p_install.add_argument("-y", "--noconfirm", action="store_true",
                            help="Skip confirmation prompt")
+    p_install.add_argument("-n", "--dry-run", action="store_true",
+                           help="Show what would be installed without making changes")
 
     # remove
     p_remove = sub.add_parser(
@@ -1492,14 +2079,20 @@ def main():
     )
     p_remove.add_argument("package", metavar="PACKAGE",
                           help="Name of the installed package to remove")
+    p_remove.add_argument("-y", "--noconfirm", action="store_true",
+                          help="Skip confirmation prompt")
 
     # list
-    sub.add_parser(
+    p_list = sub.add_parser(
         "list",
         help="List all installed packages",
         description="Print every installed package along with its version and format.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p_list.add_argument("--outdated", action="store_true",
+                        help="Only show packages with newer versions available")
+    p_list.add_argument("--json", action="store_true",
+                        help="Output as JSON")
 
     # info
     p_info = sub.add_parser(
@@ -1542,6 +2135,8 @@ def main():
     )
     p_upgrade.add_argument("-y", "--refresh", action="store_true",
                            help="Refresh the package index before upgrading")
+    p_upgrade.add_argument("-n", "--dry-run", action="store_true",
+                           help="Show what would be upgraded without making changes")
     # fetch
     p_fetch = sub.add_parser(
         "fetch",
@@ -1573,11 +2168,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # init (riot only)
+    p_init = sub.add_parser(
+        "init",
+        help="Bootstrap the system by installing bash (riot mode)",
+        description="Ensure bash is installed on the system. Intended for first-run\n"
+                    "bootstrapping on Riot live ISOs. Requires yapm.riot to be enabled.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_init.add_argument("-r", "--root", type=str, default=None, metavar="PATH",
+                        help="Install to a different root directory (requires yapm.insroot)")
+
     # build
     p_build = sub.add_parser(
         "build",
         help="Build a .yapm package from a source directory",
-        description="Package a directory into a distributable .yapm file (ZIP format).\n"
+        description="Package a directory into a distributable .yapm file (tar.zst format).\n"
                     "The directory must contain a yapm.data manifest with at least:\n"
                     "  [METADATA]  name = \"pkg\"  version = \"1.0.0\"\n"
                     "The output file is written to the current working directory.",
@@ -1585,6 +2191,67 @@ def main():
     )
     p_build.add_argument("directory", metavar="DIR",
                          help="Path to the directory containing package files and yapm.data")
+
+    # submit
+    p_submit = sub.add_parser(
+        "submit",
+        help="Submit a .yapm package to yapm-contrib",
+        description="Fork yapm-contrib, push your .yapm file, and open a pull request.\n"
+                    "Requires 'gh' CLI authenticated with GitHub.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_submit.add_argument("package", metavar="PACKAGE",
+                          help="Path to the .yapm file to submit")
+
+    # outdated
+    sub.add_parser(
+        "outdated",
+        help="Show installed packages with newer versions available",
+        description="Compare installed package versions against the index and\n"
+                    "print any that have a newer version in the configured mirrors.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # files
+    p_files = sub.add_parser(
+        "files",
+        help="List files installed by a package",
+        description="Print all files that belong to the given installed package.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_files.add_argument("package", metavar="PACKAGE",
+                         help="Name of the installed package")
+
+    # why
+    p_why = sub.add_parser(
+        "why",
+        help="Show which packages depend on a given package",
+        description="List all installed packages that list the given package\n"
+                    "as a dependency.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_why.add_argument("package", metavar="PACKAGE",
+                       help="Package name to check dependencies for")
+
+    # clean
+    sub.add_parser(
+        "clean",
+        help="Remove all cached index and download files",
+        description="Delete everything under /var/lib/yapm/cache/ to free space.\n"
+                    "The cache will be rebuilt automatically on the next 'yapm update'.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # repair
+    p_repair = sub.add_parser(
+        "repair",
+        help="Re-create missing symlinks for an installed package",
+        description="Scan the package's bin directories and re-create any\n"
+                    "missing symlinks in /usr/local/bin.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_repair.add_argument("package", metavar="PACKAGE",
+                          help="Name of the installed package to repair")
 
     # config (hidden)
     p_config = sub.add_parser("config", help=argparse.SUPPRESS)
@@ -1641,27 +2308,43 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    mirror_sub.add_parser(
+        "test",
+        help="Test all mirrors without removing unreachable ones",
+        description="Send a HEAD request to each mirror and report success/failure.\n"
+                    "Unlike 'yapm mirror sync', this does NOT remove any mirrors.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
     args = parser.parse_args()
 
-    require_root()
-    ensure_dirs()
+    if args.command != "submit":
+        require_root()
+        ensure_dirs()
 
-    if config_flag("yapm.yapm"):
-        try:
+    try:
+        if config_flag("yapm.yapm"):
+            try:
+                _dispatch(args)
+            except SystemExit:
+                print("something may or may not have gone wrong. who can say really")
+                sys.exit(0)
+        else:
             _dispatch(args)
-        except SystemExit:
-            print("something may or may not have gone wrong. who can say really")
-            sys.exit(0)
-    else:
-        _dispatch(args)
+    finally:
+        if LOCK_FILE.exists():
+            try:
+                LOCK_FILE.unlink()
+            except OSError:
+                pass
 
 def _dispatch(args):
     if args.command == "install":
-        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm)
+        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm, dry_run=args.dry_run)
     elif args.command == "remove":
-        remove_package(args.package)
+        remove_package(args.package, noconfirm=args.noconfirm)
     elif args.command == "list":
-        list_installed()
+        list_installed(outdated=args.outdated, json_output=args.json)
     elif args.command == "info":
         info_package(args.package)
     elif args.command == "search":
@@ -1669,9 +2352,21 @@ def _dispatch(args):
     elif args.command == "update":
         update_index()
     elif args.command == "upgrade":
-        upgrade_packages(refresh=args.refresh)
+        upgrade_packages(refresh=args.refresh, dry_run=args.dry_run)
     elif args.command == "build":
         build_package(args.directory)
+    elif args.command == "submit":
+        submit_package(args.package)
+    elif args.command == "outdated":
+        outdated_packages()
+    elif args.command == "files":
+        list_files(args.package)
+    elif args.command == "why":
+        why_package(args.package)
+    elif args.command == "clean":
+        clean_cache()
+    elif args.command == "repair":
+        repair_package(args.package)
     elif args.command == "version":
         ver = APP_VERSION
         if config_flag("yapm.riot"):
@@ -1685,6 +2380,8 @@ def _dispatch(args):
             print(f"config version {cv}")
     elif args.command == "uninstall":
         uninstall_yapm()
+    elif args.command == "init":
+        init_package(root=args.root)
     elif args.command == "fetch":
         update_yapm(force=args.force)
     elif args.command == "mirror":
@@ -1694,6 +2391,8 @@ def _dispatch(args):
             mirror_remove(args.url)
         elif args.mirror_cmd == "sync":
             mirror_refresh()
+        elif args.mirror_cmd == "test":
+            mirror_test()
         elif args.mirror_cmd == "list":
             mirror_list()
 
