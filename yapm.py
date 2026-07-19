@@ -1160,6 +1160,14 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
         BIN_DIR.mkdir(parents=True, exist_ok=True)
         LIB_DIR.mkdir(parents=True, exist_ok=True)
 
+        ldso_conf = Path("/etc/ld.so.conf.d/yapm.conf")
+        if not ldso_conf.exists():
+            try:
+                ldso_conf.write_text("/usr/local/lib\n")
+                print(f"  Created {ldso_conf}")
+            except Exception:
+                pass
+
         bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
         for src_dir in bin_source_dirs:
             if src_dir.exists() and src_dir.is_dir():
@@ -2029,8 +2037,14 @@ def submit_package(package_path: str):
 
     try:
         print("Forking yapm-contrib...")
-        subprocess.run(["gh", "repo", "fork", YAPM_CONTRIB_REPO, "--clone=false"],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        result = subprocess.run(["gh", "repo", "fork", YAPM_CONTRIB_REPO, "--clone=false"],
+                               capture_output=True, text=True)
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                print("  Fork already exists, continuing...")
+            else:
+                print(f"Error forking: {result.stderr.strip()}")
+                sys.exit(1)
 
         # get fork owner
         result = subprocess.run(["gh", "api", "user", "--jq", ".login"],
