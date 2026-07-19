@@ -73,8 +73,8 @@ def _parse_ver(v: str):
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.4.1"
-CURRENT_VERSION = 2  # Config version
+APP_VERSION = "0.4.2"
+CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
 CONFIG_DIR  = Path("/etc/yapm")
