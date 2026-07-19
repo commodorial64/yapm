@@ -2,12 +2,14 @@
 
 import argparse
 import ast
+import base64
 import fcntl
 import gzip
 import io
 import itertools
 import json
 import os
+import platform
 import random
 import re
 import shutil
@@ -23,6 +25,22 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
+
+_SYSTEM_ARCH = platform.machine()
+
+_DEB_ARCH_MAP = {
+    "x86_64": "amd64",
+    "aarch64": "arm64",
+    "armv7l": "armhf",
+    "i686": "i386",
+    "i386": "i386",
+}
+
+def _host_arch():
+    return _SYSTEM_ARCH
+
+def _deb_arch():
+    return _DEB_ARCH_MAP.get(_SYSTEM_ARCH, _SYSTEM_ARCH)
 
 # ============================================================
 # COLOR OUTPUT
@@ -69,6 +87,7 @@ DB_FILE     = DATA_DIR / "installed.json"
 CACHE_DIR   = DATA_DIR / "cache"
 INDEX_FILE  = CACHE_DIR / "index.json"
 BIN_DIR     = Path("/usr/local/bin")
+LIB_DIR     = Path("/usr/local/lib")
 ROOT_DIR    = Path("/")
 
 LOCK_FILE   = DATA_DIR / "yapm.lock"
@@ -646,7 +665,7 @@ def _detect_deb_distro(mirror_url: str) -> str:
 
 def parse_debian_index(mirror_url: str, merged_index: dict):
     dist = _detect_deb_distro(mirror_url)
-    url = normalize(mirror_url) + f"dists/{dist}/main/binary-amd64/Packages.gz"
+    url = normalize(mirror_url) + f"dists/{dist}/main/binary-{_deb_arch()}/Packages.gz"
     data = download(url, desc=f"Fetching Debian index from {mirror_url}")
     if not data: return
     
@@ -676,8 +695,8 @@ def parse_debian_index(mirror_url: str, merged_index: dict):
         print(f"Error parsing Debian index: {e}")
 
 def parse_arch_index(mirror_url: str, merged_index: dict):
-    for repo in ("core", "extra", "community"):
-        url = normalize(mirror_url) + f"{repo}/os/x86_64/{repo}.db"
+    for repo in ("core", "extra"):
+        url = normalize(mirror_url) + f"{repo}/os/{_host_arch()}/{repo}.db"
         data = download(url, desc=f"Fetching Arch {repo} index from {mirror_url}")
         if not data:
             continue
@@ -691,7 +710,7 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
                         if f:
                             content = f.read().decode('utf-8', errors='ignore')
                             lines = content.splitlines()
-                            name, version, arch = "", "", "x86_64"
+                            name, version, arch = "", "", _host_arch()
                             dependencies = []
                             for i, line in enumerate(lines):
                                 if line == "%NAME%": name = lines[i+1]
@@ -713,17 +732,80 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
                                     "mirror": mirror_url,
                                     "format": "arch",
                                     "dependencies": dependencies,
-                                    "download_path": f"{repo}/os/x86_64/{name}-{version}-{arch}.pkg.tar.zst"
+                                    "download_path": f"{repo}/os/{_host_arch()}/{name}-{version}-{arch}.pkg.tar.zst"
                                 })
         except Exception as e:
             print(f"Error parsing Arch {repo} index: {e}")
+
+_NIX_SEARCH_URL = "https://search.nixos.org/backend/latest-44-nixos-unstable/_search"
+_NIX_AUTH = base64.b64encode(b"aWVSALXpZv:X8gPHnzL52wFEekuxsfQ9cSh").decode()
+
+def _nix_available():
+    return shutil.which("nix-env") is not None
+
+def parse_nix_index(merged_index: dict):
+    if not _nix_available():
+        print("  Skipping NixOS index (nix-env not found)")
+        return
+    print("Fetching NixOS package index...")
+    batch_size = 5000
+    after = None
+    total_fetched = 0
+    while True:
+        body = {
+            "query": {"term": {"type": "package"}},
+            "size": batch_size,
+            "sort": [{"_doc": "asc"}],
+            "_source": [
+                "package_attr_name", "package_pversion",
+                "package_description", "package_programs",
+                "package_system", "package_outputs"
+            ]
+        }
+        if after is not None:
+            body["search_after"] = after
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            _NIX_SEARCH_URL, data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Basic " + _NIX_AUTH,
+                "User-Agent": "yapm/1.0"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"Error fetching NixOS index: {e}")
+            break
+        hits = result.get("hits", {}).get("hits", [])
+        if not hits:
+            break
+        for hit in hits:
+            src = hit.get("_source", {})
+            attr_name = src.get("package_attr_name", "")
+            version = src.get("package_pversion", "")
+            if not attr_name:
+                continue
+            merged_index["packages"].setdefault(attr_name, {})["nix"] = {
+                "version": version,
+                "description": src.get("package_description", ""),
+                "mirror": "https://search.nixos.org",
+                "format": "nix",
+                "attr": attr_name
+            }
+        total_fetched += len(hits)
+        after = hits[-1].get("sort")
+        print(f"  Fetched {total_fetched} NixOS packages...")
+    print(f"  NixOS index complete: {total_fetched} packages")
 
 def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None, arch_mode: bool = False) -> Optional[dict]:
     """Look up a specific version of a package.
 
     The index stores per-format entries as ``{pkg_name: {format: entry_dict}}``.
     When *arch_mode* is ``True`` only the ``"arch"`` sub-entry is considered;
-    otherwise the priority order is ``yapm > arch > deb``.
+    otherwise the priority order is ``yapm > arch > deb > nix``.
     """
     packages = idx.get("packages", {})
     entry = packages.get(pkg)
@@ -737,7 +819,7 @@ def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None, arch_mode: 
             return None
         entry = sub
     else:
-        for fmt in ("yapm", "arch", "deb"):
+        for fmt in ("yapm", "arch", "deb", "nix"):
             if fmt in entry:
                 entry = entry[fmt]
                 break
@@ -802,6 +884,9 @@ def update_index():
                 except Exception as e:
                     print(f"Error parsing index from {url}: {e}")
 
+    if _nix_available():
+        parse_nix_index(merged_index)
+
     with open(INDEX_FILE, "w") as f:
         json.dump(merged_index, f, indent=4)
     print("Index updated.")
@@ -816,7 +901,7 @@ def load_index() -> Dict:
     for k, v in idx.get("packages", {}).items():
         name = k.split("/", 1)[-1] if "/" in k else k
         # Normalize to nested-by-format structure
-        if any(fmt in v for fmt in ("yapm", "arch", "deb")):
+        if any(fmt in v for fmt in ("yapm", "arch", "deb", "nix")):
             normalized = v
         else:
             fmt = v.get("format", "yapm")
@@ -1072,6 +1157,9 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                     pass
     else:
         # arch/deb in sandbox mode (running on host) — fallback linking
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        LIB_DIR.mkdir(parents=True, exist_ok=True)
+
         bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
         for src_dir in bin_source_dirs:
             if src_dir.exists() and src_dir.is_dir():
@@ -1083,6 +1171,19 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                         symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
                         os.symlink(symlink_src, dest)
                         print(f"  Linked {item.name} -> {dest}")
+
+        lib_source_dirs = [extract_target / "usr" / "lib", extract_target / "lib"]
+        for src_dir in lib_source_dirs:
+            if src_dir.exists() and src_dir.is_dir():
+                for item in src_dir.iterdir():
+                    if item.is_file() or item.is_symlink():
+                        if item.suffix in ('.so', '.a') or '.so.' in item.name:
+                            dest = LIB_DIR / item.name
+                            if dest.exists() or dest.is_symlink():
+                                os.unlink(dest)
+                            symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                            os.symlink(symlink_src, dest)
+                            print(f"  Linked lib {item.name} -> {dest}")
 
         metadata_path = extract_target / "metadata.json"
         if metadata_path.exists():
@@ -1272,12 +1373,37 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         print("(dry run — no changes made)")
         return
 
+    needs_ldconfig = False
     for p in to_install_merged:
         p_ver = pin_version.get(p)
         p_mirror = pin_mirror.get(p)
         chaos_interrupt()
         display_p = chaos_wrong_name(p)
         print(f"Installing {display_p}...")
+
+        fetched_fmt = "arch" if arch_mode else (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
+
+        if fetched_fmt == "nix":
+            nix_info = (get_pkg_info(idx, p, p_ver) or {})
+            attr_name = nix_info.get("attr", p)
+            print(f"  Delegating to nix-env (nixpkgs.{attr_name})...")
+            result = subprocess.run(
+                ["nix-env", "-iA", f"nixpkgs.{attr_name}"],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"  nix-env failed: {result.stderr.strip()}")
+                sys.exit(1)
+            db[p] = {
+                "version": p_ver or nix_info.get("version", "0.0.0"),
+                "path": f"nixpkgs.{attr_name}",
+                "dependencies": [],
+                "format": "nix",
+                "metadata": {"description": nix_info.get("description", "")}
+            }
+            save_db(db)
+            print(f"Installed {display_p}.")
+            continue
 
         if p in pre_fetched_data:
             data = pre_fetched_data[p]
@@ -1287,8 +1413,6 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         if not data:
             print(f"Failed to fetch {p}. Aborting.")
             sys.exit(1)
-
-        fetched_fmt = "arch" if arch_mode else (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
 
         if config_flag("yapm.paranoid"):
             expected_fmt = fetched_fmt
@@ -1307,6 +1431,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
                 sys.exit(1)
 
         _install_single(p, db, data, fetched_fmt)
+        needs_ldconfig = True
         if fetched_fmt == "arch" and config_flag("yapm.hooks"):
             run_pkg_install_hook(data, ROOT_DIR, "post_install")
         print(f"Installed {chaos_wrong_name(p)}.")
@@ -1314,6 +1439,10 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
     if "linux" in to_install_merged and str(ROOT_DIR) != "/":
         print("Running mkinitcpio for bootstrapped system...")
         subprocess.run(["arch-chroot", str(ROOT_DIR), "mkinitcpio", "-P"], check=False)
+
+    if needs_ldconfig:
+        print("Updating library cache...")
+        subprocess.run(["ldconfig"], capture_output=True, check=False)
 
     if config_flag("yapm.yapm"):
         print("something may or may not have gone wrong. who can say really")
@@ -1340,6 +1469,23 @@ def remove_package(pkg: str, noconfirm: bool = False):
             return
 
     pkg_info = db[pkg_key]
+    fmt = pkg_info.get("format", "yapm")
+
+    if fmt == "nix":
+        attr_name = pkg_info.get("path", pkg_key)
+        print(f"Delegating removal to nix-env...")
+        result = subprocess.run(
+            ["nix-env", "-e", pkg_key],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"nix-env removal failed: {result.stderr.strip()}")
+            return
+        del db[pkg_key]
+        save_db(db)
+        print(f"Removed {format_key(pkg_key)}.")
+        return
+
     file_list = pkg_info.get("files", [])
 
     if file_list:
@@ -1382,6 +1528,17 @@ def remove_package(pkg: str, noconfirm: bool = False):
                     if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
                         os.unlink(dest)
                         print(f"Removed link {dest}")
+
+        lib_source_dirs = [target / "usr" / "lib", target / "lib"]
+        for src_dir in lib_source_dirs:
+            if src_dir.exists() and src_dir.is_dir():
+                for item in src_dir.iterdir():
+                    if item.is_file() or item.is_symlink():
+                        if item.suffix in ('.so', '.a') or '.so.' in item.name:
+                            dest = LIB_DIR / item.name
+                            if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
+                                os.unlink(dest)
+                                print(f"Removed lib link {dest}")
 
         shutil.rmtree(target, ignore_errors=True)
         print(f"Removed {format_key(pkg_key)}.")
@@ -1427,11 +1584,26 @@ def upgrade_packages(refresh: bool = False, dry_run: bool = False):
     for pkg, ver in to_upgrade:
         chaos_interrupt()
         print(f"Upgrading {pkg}...")
+        installed_fmt = db[pkg].get("format", "yapm")
+        if installed_fmt == "nix":
+            idx_entry = (get_pkg_info(idx, pkg) or {})
+            attr_name = idx_entry.get("attr", pkg)
+            result = subprocess.run(
+                ["nix-env", "-iA", f"nixpkgs.{attr_name}"],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"  nix-env failed: {result.stderr.strip()}. Skipping.")
+                continue
+            db[pkg]["version"] = ver
+            save_db(db)
+            print(f"Upgraded {pkg}.")
+            continue
         data = fetch_package(pkg, version=ver)
         if not data:
             print(f"Failed to fetch {pkg}. Skipping.")
             continue
-        _install_single(pkg, db, data, "yapm")
+        _install_single(pkg, db, data, installed_fmt)
         print(f"Upgraded {pkg}.")
 
     chaos_post_operation()
@@ -1572,7 +1744,7 @@ def info_package(pkg: str):
 
     if pkg_key in idx.get("packages", {}):
         formats_entry = idx["packages"][pkg_key]
-        for fmt_name in ("yapm", "arch", "deb"):
+        for fmt_name in ("yapm", "arch", "deb", "nix"):
             entry = formats_entry.get(fmt_name)
             if not entry:
                 continue
@@ -1600,7 +1772,7 @@ def search_package(term: str):
         display = pkg_key
         display_lower = display.lower()
 
-        for fmt_name in ("yapm", "arch", "deb"):
+        for fmt_name in ("yapm", "arch", "deb", "nix"):
             entry = formats_entry.get(fmt_name)
             if not entry:
                 continue
