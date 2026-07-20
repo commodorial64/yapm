@@ -149,7 +149,7 @@ def su_exec(extra_args: List[str]):
             sys.exit(1)
 
         yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
-        rule = f"{user} ALL=(root) NOPASSWD: {yapm_path} *\\n"
+        rule = f"{user} ALL=(root) NOPASSWD: {yapm_path} *\n"
         rule_file = Path(f"/etc/sudoers.d/yapm-{user}")
 
         if rule_file.exists():
