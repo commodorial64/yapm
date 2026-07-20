@@ -22,7 +22,7 @@ import urllib.request
 import urllib.error
 import zipfile
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
 
@@ -73,7 +73,7 @@ def _parse_ver(v: str):
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.5.0"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
@@ -123,7 +123,7 @@ DEFAULT_CONFIG = {
         {"url": "https://archive.ubuntu.com/ubuntu/", "priority": 10},
         {"url": "https://deb.debian.org/debian/", "priority": 20},
         {"url": "https://mirror.rackspace.com/archlinux/", "priority": 30},
-        {"url": "https://yapm.pages.dev/", "priority": 50}
+        {"url": "https://yapm.pages.dev/", "priority": 0}
     ]
 }
 
@@ -133,6 +133,501 @@ def require_root():
         print("Error: yapm must be run with sudo.")
         print("  Try: sudo yapm <command>")
         sys.exit(1)
+
+def su_exec(extra_args: List[str]):
+    """Set up passwordless sudo for yapm via a sudoers drop-in rule.
+
+    run once with sudo, then yapm never needs sudo again.
+    +Creates /etc/sudoers.d/yapm-<user> allowing the current user to run
+    yapm as root without a password.
+    """
+    if os.getuid() == 0:
+        print("Already running as root.")
+        sys.exit(0)
+
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+    if not user or user == "root":
+        print("Error: could not determine current user.")
+        sys.exit(1)
+
+    yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
+    rule = f"{user} ALL=(root) NOPASSWD: {yapm_path} *\\n"
+    rule_file = Path(f"/etc/sudoers.d/yapm-{user}")
+
+    if rule_file.exists():
+        existing = rule_file.read_text()
+        if yapm_path in existing:
+            print(f"yapm is already set up for passwordless use ({rule_file}).")
+            if extra_args:
+                print("Re-executing with elevated privileges...")
+                os.execvp("sudo", ["sudo", yapm_path] + extra_args)
+            sys.exit(0)
+
+    if not extra_args:
+        print(f"Creating sudoers rule for {user}...")
+        rule_file.write_text(rule)
+        rule_file.chmod(0o440)
+
+        result = subprocess.run(["visudo", "-c"], capture_output=True, text=True)
+        if result.returncode != 0:
+            rule_file.unlink(missing_ok=True)
+            print("Error: sudoers validation failed. Rule not applied.")
+            print(result.stderr.strip())
+            sys.exit(1)
+
+        print(f"Done. {user} can now run yapm without sudo.")
+        print(f"  Rule: {rule_file}")
+        print("  You may need to open a new shell for changes to take effect.")
+    else:
+        cmd = ["sudo", yapm_path] + extra_args
+        print(f"Re-executing with sudo: {' '.join(extra_args)}")
+        os.execvp("sudo", cmd)
+
+# ============================================================
+# SHELL COMPLETIONS
+# ============================================================
+
+_BASH_COMPLETION = '''\
+_yapm() {
+    local cur prev commands
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="install remove list info search update upgrade fetch version uninstall riot build submit outdated files why clean repair mirror hall su fetch-count completions"
+
+    if [[ ${cur} == -* ]]; then
+        case "${COMP_WORDS[1]}" in
+            install)  COMPREPLY=( $(compgen -W "-m -r -y -n -H -f --mirror --root --noconfirm --dry-run --hall --format" -- ${cur}) ) ;;
+            remove)   COMPREPLY=( $(compgen -W "-y --noconfirm" -- ${cur}) ) ;;
+            list)     COMPREPLY=( $(compgen -W "-o -j --outdated --json" -- ${cur}) ) ;;
+            upgrade)  COMPREPLY=( $(compgen -W "-y -n --refresh --dry-run" -- ${cur}) ) ;;
+            mirror)   COMPREPLY=( $(compgen -W "add list remove sync test show" -- ${cur}) ) ;;
+            hall)     COMPREPLY=( $(compgen -W "add list remove show" -- ${cur}) ) ;;
+            completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- ${cur}) ) ;;
+            *)        COMPREPLY=( $(compgen -W "--help" -- ${cur}) ) ;;
+        esac
+        return 0
+    fi
+
+    if [[ ${COMP_CWORD} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
+        return 0
+    fi
+
+    case "${COMP_WORDS[1]}" in
+        install|info|files|why|repair|hall)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                local pkgs
+                pkgs=$(yapm list --json 2>/dev/null | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).keys()))" 2>/dev/null)
+                COMPREPLY=( $(compgen -W "${pkgs}" -- ${cur}) )
+            fi
+            ;;
+        mirror)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "add list remove sync test show" -- ${cur}) )
+            elif [[ "${COMP_WORDS[2]}" == "add" ]]; then
+                COMPREPLY=( $(compgen -f -X '!*.url' -- ${cur}) )
+            elif [[ "${COMP_WORDS[2]}" == "remove" ]]; then
+                COMPREPLY=( $(compgen -W "$(yapm mirror list 2>/dev/null | grep -oP 'https?://\\S+')" -- ${cur}) )
+            elif [[ "${COMP_WORDS[2]}" == "show" ]]; then
+                COMPREPLY=( $(compgen -W "$(yapm list --json 2>/dev/null | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).keys()))" 2>/dev/null)" -- ${cur}) )
+            fi
+            ;;
+        hall)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "add list remove show" -- ${cur}) )
+            elif [[ "${COMP_WORDS[2]}" == "remove" || "${COMP_WORDS[2]}" == "show" ]]; then
+                : # hall names are static, could be added later
+            fi
+            ;;
+    esac
+    return 0
+}
+complete -F _yapm yapm
+'''
+
+_ZSH_COMPLETION = '''\
+#compdef yapm
+
+_yapm() {
+    local -a commands
+    commands=(
+        'install:Install a package from a mirror or local file'
+        'remove:Remove an installed package'
+        'list:List installed packages'
+        'info:Show package details'
+        'search:Search the local package index'
+        'update:Refresh the package index from mirrors'
+        'upgrade:Upgrade installed packages'
+        'fetch:Update yapm itself'
+        'version:Print yapm version information'
+        'uninstall:Uninstall yapm from the system'
+        'riot:Bootstrap the system by installing bash'
+        'build:Build a .yapm package from source'
+        'submit:Submit a package to yapm-contrib'
+        'outdated:Show packages with newer versions'
+        'files:List files installed by a package'
+        'why:Show reverse dependencies'
+        'clean:Remove cached index/download files'
+        'repair:Re-create missing symlinks'
+        'mirror:Manage package mirrors'
+        'hall:Manage mirror groups'
+        'su:Re-run a command with sudo'
+        'fetch-count:Print package count for fetch tools'
+        'completions:Generate shell completion scripts'
+    )
+
+    _arguments -C \
+        '1:command:->cmd' \
+        '*::arg:->args'
+
+    case $state in
+        cmd)
+            _describe 'command' commands
+            ;;
+        args)
+            case $words[1] in
+                install)
+                    _arguments \
+                        '-m[Pin to mirror by index]:mirror index:' \
+                        '--mirror[Pin to mirror by index]:mirror index:' \
+                        '-H[Only use mirrors from named hall]:hall name:' \
+                        '--hall[Only use mirrors from named hall]:hall name:' \
+                        '-r[Install to different root]:root path:_files' \
+                        '--root[Install to different root]:root path:_files' \
+                        '-y[Skip confirmation]' \
+                        '--noconfirm[Skip confirmation]' \
+                        '-n[Dry run]' \
+                        '--dry-run[Dry run]' \
+                        '-f[Package format]:format:(yapm deb arch)' \
+                        '*:package:_files -g "*.yapm -o *.deb -o *.pkg.tar.zst"' && ret=0
+                    ;;
+                remove)
+                    _arguments '-y[Skip confirmation]' '--noconfirm[Skip confirmation]' '*:package:_yapm_installed' && ret=0
+                    ;;
+                list)
+                    _arguments '-o[Show outdated only]' '--outdated[Show outdated only]' '-j[JSON output]' '--json[JSON output]' && ret=0
+                    ;;
+                info)
+                    _arguments '*:package:_yapm_installed' && ret=0
+                    ;;
+                mirror)
+                    _arguments '1:subcommand:(add list remove sync test show)' && ret=0
+                    ;;
+                hall)
+                    _arguments '1:subcommand:(add list remove show)' && ret=0
+                    ;;
+                completions)
+                    _arguments '1:shell:(bash zsh fish)' && ret=0
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_yapm_installed() {
+    local -a pkgs
+    pkgs=(${(f)"$(yapm list --json 2>/dev/null | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin).keys()))' 2>/dev/null)})
+    _describe 'installed package' pkgs
+}
+
+_yapm "$@"
+'''
+
+_FISH_COMPLETION = '''\
+# yapm fish completions
+
+function __yapm_mirrors
+    yapm mirror list 2>/dev/null | grep -oP 'https?://\\S+'
+end
+
+function __yapm_halls
+    echo "add\tCreate a hall from mirror indices"
+    echo "list\tList all halls"
+    echo "remove\tRemove a hall"
+    echo "show\tShow mirrors in a hall"
+end
+
+function __yapm_mirror_sub
+    echo "add\tAdd a new mirror"
+    echo "list\tList all mirrors"
+    echo "remove\tRemove a mirror"
+    echo "sync\tTest and remove unreachable mirrors"
+    echo "test\tTest mirrors without removing"
+    echo "show\tShow all packages in the index"
+end
+
+function __yapm_installed
+    yapm list --json 2>/dev/null | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin).keys()))' 2>/dev/null
+end
+
+# Subcommands
+complete -c yapm -n '__fish_use_subcommand' -a install -d 'Install a package'
+complete -c yapm -n '__fish_use_subcommand' -a remove -d 'Remove an installed package'
+complete -c yapm -n '__fish_use_subcommand' -a list -d 'List installed packages'
+complete -c yapm -n '__fish_use_subcommand' -a info -d 'Show package details'
+complete -c yapm -n '__fish_use_subcommand' -a search -d 'Search the local package index'
+complete -c yapm -n '__fish_use_subcommand' -a update -d 'Refresh the package index'
+complete -c yapm -n '__fish_use_subcommand' -a upgrade -d 'Upgrade installed packages'
+complete -c yapm -n '__fish_use_subcommand' -a fetch -d 'Update yapm itself'
+complete -c yapm -n '__fish_use_subcommand' -a version -d 'Print version information'
+complete -c yapm -n '__fish_use_subcommand' -a uninstall -d 'Uninstall yapm'
+complete -c yapm -n '__fish_use_subcommand' -a riot -d 'Bootstrap with bash'
+complete -c yapm -n '__fish_use_subcommand' -a build -d 'Build .yapm from source'
+complete -c yapm -n '__fish_use_subcommand' -a submit -d 'Submit package to yapm-contrib'
+complete -c yapm -n '__fish_use_subcommand' -a outdated -d 'Show outdated packages'
+complete -c yapm -n '__fish_use_subcommand' -a files -d 'List files in a package'
+complete -c yapm -n '__fish_use_subcommand' -a why -d 'Show reverse dependencies'
+complete -c yapm -n '__fish_use_subcommand' -a clean -d 'Remove cached files'
+complete -c yapm -n '__fish_use_subcommand' -a repair -d 'Re-create missing symlinks'
+complete -c yapm -n '__fish_use_subcommand' -a mirror -d 'Manage mirrors'
+complete -c yapm -n '__fish_use_subcommand' -a hall -d 'Manage mirror groups'
+complete -c yapm -n '__fish_use_subcommand' -a su -d 'Re-run with sudo'
+complete -c yapm -n '__fish_use_subcommand' -a fetch-count -d 'Package count for fetch tools'
+complete -c yapm -n '__fish_use_subcommand' -a completions -d 'Generate shell completions'
+
+# install flags
+complete -c yapm -n '__fish_seen_subcommand_from install' -s m -l mirror -d 'Pin to mirror by index' -r
+complete -c yapm -n '__fish_seen_subcommand_from install' -s H -l hall -d 'Only use mirrors from named hall' -r
+complete -c yapm -n '__fish_seen_subcommand_from install' -s r -l root -d 'Install to different root' -r -F
+complete -c yapm -n '__fish_seen_subcommand_from install' -s y -l noconfirm -d 'Skip confirmation'
+complete -c yapm -n '__fish_seen_subcommand_from install' -s n -l dry-run -d 'Dry run'
+complete -c yapm -n '__fish_seen_subcommand_from install' -s f -l format -d 'Package format' -r -a 'yapm deb arch'
+
+# remove/list/upgrade flags
+complete -c yapm -n '__fish_seen_subcommand_from remove' -s y -l noconfirm -d 'Skip confirmation'
+complete -c yapm -n '__fish_seen_subcommand_from list' -s o -l outdated -d 'Show outdated only'
+complete -c yapm -n '__fish_seen_subcommand_from list' -s j -l json -d 'JSON output'
+complete -c yapm -n '__fish_seen_subcommand_from upgrade' -s y -l refresh -d 'Refresh index first'
+complete -c yapm -n '__fish_seen_subcommand_from upgrade' -s n -l dry-run -d 'Dry run'
+
+# mirror/hall subcompletions
+complete -c yapm -n '__fish_seen_subcommand_from mirror' -a '(__yapm_mirror_sub)'
+complete -c yapm -n '__fish_seen_subcommand_from hall' -a '(__yapm_halls)'
+complete -c yapm -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
+'''
+
+
+def completions_generate(shell: str):
+    """Output shell-specific completion script."""
+    scripts = {
+        "bash": _BASH_COMPLETION,
+        "zsh": _ZSH_COMPLETION,
+        "fish": _FISH_COMPLETION,
+    }
+    if shell not in scripts:
+        print(f"Error: unsupported shell '{shell}'. Choose from: bash, zsh, fish")
+        sys.exit(1)
+    print(scripts[shell])
+
+SETUP_MARKER = DATA_DIR / ".setup_done"
+SETUP_MARKER_USER = Path.home() / ".yapm" / ".setup_done"
+
+def _detect_shell() -> str:
+    """Detect the user's shell from $SHELL."""
+    shell_path = os.environ.get("SUDO_USER") and f"/etc/passwd"  # unused, keep simple
+    full = os.environ.get("SHELL", "")
+    name = Path(full).name if full else ""
+    if name in ("bash", "zsh", "fish"):
+        return name
+    return "bash"
+
+def _detect_user() -> str:
+    """Get the non-root user who invoked this (via sudo or directly)."""
+    for var in ("SUDO_USER", "LOGNAME", "USER"):
+        u = os.environ.get(var, "")
+        if u and u != "root":
+            return u
+    return "root"
+
+def _install_completions_bash(yapm_path: str):
+    script = _BASH_COMPLETION
+    # system-wide
+    sys_dir = Path("/etc/bash_completion.d")
+    if sys_dir.is_dir() and os.access(sys_dir, os.W_OK):
+        (sys_dir / "yapm").write_text(script)
+        print(f"  Installed bash completions → {sys_dir / 'yapm'}")
+        return
+    # user-local fallback
+    user = _detect_user()
+    if user != "root":
+        local_dir = Path(f"/home/{user}/.local/share/bash-completion/completions")
+    else:
+        local_dir = Path.home() / ".local/share/bash-completion/completions"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "yapm").write_text(script)
+    print(f"  Installed bash completions → {local_dir / 'yapm'}")
+
+def _install_completions_zsh(yapm_path: str):
+    script = _ZSH_COMPLETION
+    # system-wide
+    sys_dir = Path("/usr/share/zsh/site-functions")
+    if sys_dir.is_dir() and os.access(sys_dir, os.W_OK):
+        (sys_dir / "_yapm").write_text(script)
+        print(f"  Installed zsh completions → {sys_dir / '_yapm'}")
+        return
+    # user-local fallback
+    user = _detect_user()
+    if user != "root":
+        local_dir = Path(f"/home/{user}/.zsh/functions")
+    else:
+        local_dir = Path.home() / ".zsh/functions"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "_yapm").write_text(script)
+    print(f"  Installed zsh completions → {local_dir / '_yapm'}")
+    # add to fpath in .zshrc if not already there
+    zshrc = Path.home() / ".zshrc"
+    fpath_line = f'fpath=({local_dir} $fpath)'
+    if zshrc.exists() and fpath_line in zshrc.read_text():
+        return
+    if zshrc.exists():
+        with open(zshrc, "a") as f:
+            f.write(f"\n# yapm completions\n{fpath_line}\nautoload -Uz compinit && compinit\n")
+
+def _install_completions_fish(yapm_path: str):
+    script = _FISH_COMPLETION
+    # system-wide
+    sys_dir = Path("/usr/share/fish/vendor_completions.d")
+    if sys_dir.is_dir() and os.access(sys_dir, os.W_OK):
+        (sys_dir / "yapm.fish").write_text(script)
+        print(f"  Installed fish completions → {sys_dir / 'yapm.fish'}")
+        return
+    # user-local fallback
+    user = _detect_user()
+    if user != "root":
+        local_dir = Path(f"/home/{user}/.config/fish/completions")
+    else:
+        local_dir = Path.home() / ".config/fish/completions"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "yapm.fish").write_text(script)
+    print(f"  Installed fish completions → {local_dir / 'yapm.fish'}")
+
+def _install_fetch_count(shell: str):
+    """Patch neofetch/fastfetch to count yapm packages."""
+    _patch_neofetch()
+    _patch_fastfetch()
+
+def _patch_neofetch():
+    """Inject yapm into neofetch's get_packages() function."""
+    neofetch_path = shutil.which("neofetch")
+    if not neofetch_path:
+        return
+    try:
+        content = Path(neofetch_path).read_text()
+    except (OSError, PermissionError):
+        return
+
+    marker = "# yapm package manager"
+    if marker in content:
+        print(f"  neofetch already patched → {neofetch_path}")
+        return
+
+    # inject after the pacman line
+    anchor = 'has pacman-key && tot pacman -Qq --color never'
+    if anchor not in content:
+        print(f"  Warning: could not find insertion point in {neofetch_path}")
+        return
+
+    injection = f'{anchor}\n            {marker}\n            has yapm && tot yapm list'
+    content = content.replace(anchor, injection, 1)
+    try:
+        Path(neofetch_path).write_text(content)
+        print(f"  Patched neofetch → {neofetch_path}")
+    except (OSError, PermissionError) as e:
+        print(f"  Warning: could not patch neofetch: {e}")
+
+def _patch_fastfetch():
+    """Add yapm to fastfetch's packages config."""
+    fastfetch_path = shutil.which("fastfetch")
+    if not fastfetch_path:
+        return
+
+    config_file = Path.home() / ".config/fastfetch/config.jsonc"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # read existing or create default
+    if config_file.exists():
+        try:
+            content = config_file.read_text()
+        except (OSError, PermissionError):
+            return
+    else:
+        content = ""
+
+    if "yapm" in content:
+        print(f"  fastfetch already configured → {config_file}")
+        return
+
+    # parse existing modules or use defaults
+    default_modules: List[Any] = ["title", "separator", "os", "kernel", "packages", "shell"]
+    modules: List[Any] = default_modules
+
+    if content.strip():
+        try:
+            import re
+            # strip comments for parsing
+            cleaned = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+            cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
+            cfg = json.loads(cleaned)
+            modules = cfg.get("modules", default_modules)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # insert yapm module before the last entry (usually "shell")
+    yapm_module = {
+        "type": "command",
+        "key": "Packages (yapm)",
+        "command": "yapm fetch-count 2>/dev/null"
+    }
+    if yapm_module not in modules:
+        # put it after "packages" if present, else before the last entry
+        if "packages" in modules:
+            idx = modules.index("packages") + 1
+            modules.insert(idx, yapm_module)
+        else:
+            modules.insert(-1, yapm_module)
+
+    config = {"modules": modules}
+    try:
+        config_file.write_text(json.dumps(config, indent=4) + "\n")
+        print(f"  Patched fastfetch → {config_file}")
+    except (OSError, PermissionError) as e:
+        print(f"  Warning: could not patch fastfetch: {e}")
+
+def setup():
+    """One-time setup: install shell completions and fetch-count integration."""
+    if SETUP_MARKER.exists() or SETUP_MARKER_USER.exists():
+        print("yapm is already set up. To re-run: rm ~/.yapm/.setup_done && yapm setup")
+        return
+
+    shell = _detect_shell()
+    yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
+
+    print(f"Setting up yapm for {shell}...")
+
+    if shell == "bash":
+        _install_completions_bash(yapm_path)
+    elif shell == "zsh":
+        _install_completions_zsh(yapm_path)
+    elif shell == "fish":
+        _install_completions_fish(yapm_path)
+
+    _install_fetch_count(shell)
+
+    # make installed.json world-readable so neofetch/fastfetch can count packages
+    try:
+        DB_FILE.chmod(0o644)
+        DB_FILE.parent.chmod(0o755)
+    except (OSError, PermissionError):
+        pass
+
+    for marker in (SETUP_MARKER, SETUP_MARKER_USER):
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"shell": shell, "user": _detect_user()}))
+        except (OSError, PermissionError):
+            pass
+    print(f"\nSetup complete. Open a new shell or run 'source ~/.{shell}rc' to activate.")
 
 
 def check_deps():
@@ -253,25 +748,33 @@ def config_flag(name: str) -> bool:
     return val.lower() == "true"
 
 def load_db() -> Dict:
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not DB_FILE.exists():
-        DB_FILE.write_text("{}")
-    with _FileLock(DB_FILE):
-        with open(DB_FILE) as f:
-            db = json.load(f)
-        migrated = False
-        new_db = {}
-        for k, v in db.items():
-            if "/" in k:
-                author, name = k.split("/", 1)
-                v.setdefault("metadata", {})["author"] = author
-                new_db[name] = v
-                migrated = True
-            else:
-                new_db[k] = v
-        if migrated:
-            _write_db(new_db)
-    return new_db
+    try:
+        DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not DB_FILE.exists():
+            DB_FILE.write_text("{}")
+        with _FileLock(DB_FILE):
+            with open(DB_FILE) as f:
+                db = json.load(f)
+            migrated = False
+            new_db = {}
+            for k, v in db.items():
+                if "/" in k:
+                    author, name = k.split("/", 1)
+                    v.setdefault("metadata", {})["author"] = author
+                    new_db[name] = v
+                    migrated = True
+                else:
+                    new_db[k] = v
+            if migrated:
+                _write_db(new_db)
+        return new_db
+    except (OSError, PermissionError):
+        # non-root read-only fallback (e.g. neofetch counting packages)
+        try:
+            with open(DB_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 def _write_db(db: Dict):
     with open(DB_FILE, "w") as f:
@@ -301,7 +804,30 @@ def format_key(key: str) -> str:
 
 def sorted_mirrors() -> List[Dict]:
     config = load_config()
-    return sorted(config["mirrors"], key=lambda x: x["priority"])
+    official = [m for m in config["mirrors"] if "yapm.pages.dev" in m["url"]]
+    others = sorted((m for m in config["mirrors"] if "yapm.pages.dev" not in m["url"]),
+                     key=lambda x: x["priority"])
+    return official + others
+
+def resolve_hall(hall_name: str) -> List[Dict]:
+    """Resolve a hall name to its list of mirror dicts."""
+    config = load_config()
+    halls = config.get("halls", {})
+    if hall_name not in halls:
+        print(f"Error: Hall '{hall_name}' not found.")
+        print(f"Available halls: {', '.join(sorted(halls.keys())) or '(none)'}")
+        sys.exit(1)
+    urls = halls[hall_name]
+    mirrors = sorted_mirrors()
+    url_to_mirror = {m["url"]: m for m in mirrors}
+    result = []
+    for url in urls:
+        m = url_to_mirror.get(url)
+        if m:
+            result.append(m)
+        else:
+            result.append({"url": url, "priority": 99})
+    return result
 
 def validate_mirror(url: str) -> bool:
     try:
@@ -550,6 +1076,169 @@ def mirror_refresh():
 def mirror_preset():
     save_config(DEFAULT_CONFIG)
     print("Restored default mirrors.")
+
+def mirror_show():
+    idx = load_index()
+    packages = idx.get("packages", {})
+    if not packages:
+        print("No packages in index. Run 'yapm update' first.")
+        return
+
+    db = load_db()
+
+    # determine column widths from the data
+    name_ver_parts = []
+    for pkg_key, formats_entry in packages.items():
+        for fmt_name in ("yapm", "arch", "deb", "nix"):
+            entry = formats_entry.get(fmt_name)
+            if not entry:
+                continue
+            if "versions" in entry:
+                latest = entry.get("latest", "")
+                ver_str = f"{pkg_key} (v{latest})"
+            else:
+                ver_str = f"{pkg_key} (v{entry.get('version', '?')})"
+            name_ver_parts.append(ver_str)
+            break
+
+    col1_width = max((len(s) for s in name_ver_parts), default=30) + 4
+
+    for pkg_key in sorted(packages):
+        formats_entry = packages[pkg_key]
+        entry = None
+        fmt_name = None
+        for fmt in ("yapm", "arch", "deb", "nix"):
+            if formats_entry.get(fmt):
+                entry = formats_entry[fmt]
+                fmt_name = fmt
+                break
+        if not entry:
+            continue
+
+        if "versions" in entry:
+            latest = entry.get("latest", "")
+            ver_info = entry["versions"].get(latest, {})
+            ver_str = f"v{latest}"
+        else:
+            ver_str = f"v{entry.get('version', '?')}"
+            ver_info = entry
+
+        desc = ver_info.get("description", entry.get("description", ""))
+        author = ver_info.get("author", entry.get("author", ""))
+        license_ = ver_info.get("license", entry.get("license", ""))
+
+        left = f"{pkg_key} ({ver_str})"
+        if len(left) < col1_width:
+            padding = " " * (col1_width - len(left))
+        else:
+            padding = " "
+
+        desc_display = desc if len(desc) <= 50 else desc[:47] + "..."
+
+        installed_mark = ""
+        if pkg_key in db:
+            installed_mark = f" {Color.GREEN}[installed]{Color.RESET}"
+
+        print(f"{Color.BOLD}{left}{Color.RESET}{padding}{desc_display}{installed_mark}")
+        detail = f"  {Color.DIM}{author}  {license_}{Color.RESET}"
+        print(detail)
+
+def parse_selection(sel: str, mirrors: List[Dict]) -> List[Dict]:
+    """Parse a mirror selection string and return the matching mirrors.
+
+    Supports:
+        1-3     range (mirrors 1 through 3 inclusive)
+        [1,5]   pinpoint (mirrors 1 and 5)
+        3       single mirror
+    Indices are 1-based, matching 'yapm mirror list' output.
+    """
+    sel = sel.strip()
+    results = []
+
+    if sel.startswith("[") and sel.endswith("]"):
+        inner = sel[1:-1]
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        for p in parts:
+            idx = int(p)
+            if idx < 1 or idx > len(mirrors):
+                print(f"Error: mirror index {idx} is out of range (1-{len(mirrors)}).")
+                sys.exit(1)
+            results.append(mirrors[idx - 1])
+    elif "-" in sel and not sel.startswith("-"):
+        parts = sel.split("-", 1)
+        start = int(parts[0])
+        end = int(parts[1])
+        if start < 1 or end > len(mirrors) or start > end:
+            print(f"Error: range {sel} is out of bounds (1-{len(mirrors)}).")
+            sys.exit(1)
+        results = mirrors[start - 1 : end]
+    else:
+        idx = int(sel)
+        if idx < 1 or idx > len(mirrors):
+            print(f"Error: mirror index {idx} is out of range (1-{len(mirrors)}).")
+            sys.exit(1)
+        results = [mirrors[idx - 1]]
+
+    return results
+
+# ============================================================
+# HALL COMMANDS
+# ============================================================
+
+def hall_add(selection: str, name: str):
+    config = load_config()
+    halls = config.get("halls", {})
+    if name in halls:
+        print(f"Hall '{name}' already exists. Use 'yapm hall remove {name}' first.")
+        return
+    mirrors = sorted_mirrors()
+    chosen = parse_selection(selection, mirrors)
+    if not chosen:
+        print("No mirrors selected.")
+        return
+    halls[name] = [m["url"] for m in chosen]
+    config["halls"] = halls
+    save_config(config)
+    print(f"Hall '{name}' created with {len(chosen)} mirror(s):")
+    for m in chosen:
+        print(f"  {m['url']}")
+
+def hall_list():
+    config = load_config()
+    halls = config.get("halls", {})
+    if not halls:
+        print("No halls defined. Create one with 'yapm hall add <selection> <name>'.")
+        return
+    for name, urls in sorted(halls.items()):
+        print(f"{Color.BOLD}{name}{Color.RESET} ({len(urls)} mirror(s))")
+
+def hall_remove(name: str):
+    config = load_config()
+    halls = config.get("halls", {})
+    if name not in halls:
+        print(f"Hall '{name}' not found.")
+        return
+    del halls[name]
+    config["halls"] = halls
+    save_config(config)
+    print(f"Hall '{name}' removed.")
+
+def hall_show(name: str):
+    config = load_config()
+    halls = config.get("halls", {})
+    if name not in halls:
+        print(f"Hall '{name}' not found.")
+        return
+    urls = halls[name]
+    mirrors = sorted_mirrors()
+    url_to_mirror = {m["url"]: m for m in mirrors}
+    print(f"Hall '{name}' — {len(urls)} mirror(s):")
+    for url in urls:
+        m = url_to_mirror.get(url)
+        if m:
+            print(f"  {url} (priority {m['priority']})")
+        else:
+            print(f"  {url} {Color.DIM}(not currently configured){Color.RESET}")
 
 # ============================================================
 # PACKAGE EXTRACTION ENGINES
@@ -840,14 +1529,17 @@ def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None, arch_mode: 
         return result
     return dict(entry)
 
-def update_index():
+def update_index(hall: Optional[str] = None):
     if config_flag("yapm.yapm"):
         print("found 0 updates")
         time.sleep(1)
         print("just kidding")
     print("Updating package index...")
     merged_index = {"packages": {}}
-    for mirror in sorted_mirrors():
+    mirrors = resolve_hall(hall) if hall else sorted_mirrors()
+    if hall:
+        print(f"  (filtered to hall '{hall}' — {len(mirrors)} mirror(s))")
+    for mirror in mirrors:
         url = mirror["url"]
         if "ubuntu.com" in url or "debian.org" in url:
             parse_debian_index(url, merged_index)
@@ -935,7 +1627,7 @@ def fetch_from_github(pkg_name: str, repo: str, version: Optional[str]) -> Optio
                     return data
     return None
 
-def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None, arch_mode: bool = False) -> Optional[bytes]:
+def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None, arch_mode: bool = False, hall: Optional[str] = None) -> Optional[bytes]:
     idx = load_index()
     pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
     fmt = "arch" if arch_mode else (pkg_info or {}).get("format", "yapm")
@@ -972,7 +1664,7 @@ def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[
         if data:
             return data
 
-    for mirror in sorted_mirrors():
+    for mirror in (resolve_hall(hall) if hall else sorted_mirrors()):
         data = _try_at(mirror["url"])
         if data:
             return data
@@ -1215,11 +1907,11 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
     save_db(db)
 
-def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False, dry_run: bool = False):
+def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False, dry_run: bool = False, hall: Optional[str] = None):
     if config_flag("yapm.yapm"):
         chaos_spinner(3)
     if config_flag("yapm.autoupdate"):
-        update_index()
+        update_index(hall=hall)
 
     if root and root != "/":
         if not config_flag("yapm.insroot"):
@@ -1416,7 +2108,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         if p in pre_fetched_data:
             data = pre_fetched_data[p]
         else:
-            data = fetch_package(p, mirror_url=p_mirror, version=p_ver, arch_mode=arch_mode)
+            data = fetch_package(p, mirror_url=p_mirror, version=p_ver, arch_mode=arch_mode, hall=hall)
 
         if not data:
             print(f"Failed to fetch {p}. Aborting.")
@@ -1453,7 +2145,13 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         subprocess.run(["ldconfig"], capture_output=True, check=False)
 
     if config_flag("yapm.yapm"):
-        print("something may or may not have gone wrong. who can say really")
+        print("something may or may have gone wrong. who can say really")
+
+    if not SETUP_MARKER.exists() and not SETUP_MARKER_USER.exists():
+        try:
+            setup()
+        except Exception:
+            pass  # non-fatal — completions are nice-to-have
 
     chaos_post_operation()
 
@@ -1631,6 +2329,16 @@ def init_package(noconfirm: bool = False, root: Optional[str] = None):
     print("Bootstrapping system: installing bash...")
     install_package(["bash"], fmt="yapm", noconfirm=True, root=root)
     print("bash installed. Shell is ready.")
+
+def fetch_count():
+    """Print installed package count for neofetch/fastfetch integration."""
+    try:
+        db = load_db()
+    except (OSError, PermissionError):
+        print("0 (yapm)")
+        return
+    count = len(db)
+    print(f"{count} (yapm)")
 
 def list_installed(outdated: bool = False, json_output: bool = False):
     db = load_db()
@@ -1982,6 +2690,60 @@ def build_package(directory: str):
 
     print(f"Success! Package built: {out_file}")
 
+def generate_yapm_data(target_dir: str):
+    """Generate a template yapm.data file with all fields documented."""
+    path = Path(target_dir) / "yapm.data"
+    if path.exists():
+        print(f"Error: {path} already exists. Remove it first or use a different directory.")
+        sys.exit(1)
+
+    template = """\
+// YAPM Package Definition File
+// Similar to a Debian CONTROL file or Arch PKGBUILD.
+// Lines starting with // are comments. /* ... */ for multi-line comments.
+
+[METADATA]
+// ─── REQUIRED ──────────────────────────────────────────────
+// These fields MUST be filled in or 'yapm build' will fail.
+
+name = "my-package"                    // Unique package name (no spaces)
+version = "1.0.0"                      // Semantic version (major.minor.patch)
+description = "A short description"    // One-line summary (shown in 'yapm search')
+author = "your-name"                   // Your name or handle
+license = "MIT"                        // SPDX license identifier
+
+// ─── OPTIONAL ──────────────────────────────────────────────
+
+// Dependencies: other packages that must be installed first.
+// Use package names as they appear in 'yapm search'.
+// dependencies = ["python3", "zstd"]
+
+[CONTENT]
+// ─── OPTIONAL ──────────────────────────────────────────────
+// These point to files inside your package's run/ or build/ folders.
+// YAPM links RunFile to /usr/local/bin/ automatically.
+
+// RunFile = my-program             // Primary executable (linked to PATH)
+// BuildFile = build.sh             // Build/compile script (run before install)
+// PreInstall = pre-install.sh      // Runs before files are copied
+// PostInstall = post-install.sh    // Runs after files are copied
+
+[FILES]
+// ─── OPTIONAL ──────────────────────────────────────────────
+// Maps extra files from inside the package to locations on the system.
+// Format: "source_in_package" = "destination_on_system"
+
+// "config/default.conf" = "/etc/my-package/config.conf"
+// "assets/icon.png" = "/usr/share/my-package/icon.png"
+// "service/my-package.service" = "/etc/systemd/system/my-package.service"
+"""
+
+    path.write_text(template)
+    print(f"Generated {path}")
+    print()
+    print("Fill in the [METADATA] section, then run:")
+    print(f"  yapm build {target_dir}")
+
 # ============================================================
 # CONFIG COMMAND
 # ============================================================
@@ -2021,23 +2783,22 @@ def submit_package(package_path: str):
         print(f"Error validating package: {e}")
         sys.exit(1)
 
-    # check gh is available and authenticated
+    # check gh is available
     if not shutil.which("gh"):
         print("Error: 'gh' CLI is required. Install it from https://cli.github.com/")
         sys.exit(1)
-    try:
-        subprocess.run(["gh", "auth", "status"], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        print("Error: not logged into GitHub. Run 'gh auth login' first.")
-        sys.exit(1)
+
+    # When running via sudo, gh commands need to run as the original user
+    # since gh auth is stored in the user's home directory.
+    real_user = os.environ.get("SUDO_USER")
+    gh_cmd = ["sudo", "-u", real_user, "gh"] if real_user else ["gh"]
 
     branch = f"submit-{pkg.stem}"
     tmpdir = tempfile.mkdtemp()
 
     try:
         print("Forking yapm-contrib...")
-        result = subprocess.run(["gh", "repo", "fork", YAPM_CONTRIB_REPO, "--clone=false"],
+        result = subprocess.run(gh_cmd + ["repo", "fork", YAPM_CONTRIB_REPO, "--clone=false"],
                                capture_output=True, text=True)
         if result.returncode != 0:
             if "already exists" in result.stderr:
@@ -2047,7 +2808,7 @@ def submit_package(package_path: str):
                 sys.exit(1)
 
         # get fork owner
-        result = subprocess.run(["gh", "api", "user", "--jq", ".login"],
+        result = subprocess.run(gh_cmd + ["api", "user", "--jq", ".login"],
                                 capture_output=True, text=True, check=True)
         fork_owner = result.stdout.strip()
         fork_url = f"https://github.com/{fork_owner}/yapm-contrib.git"
@@ -2069,7 +2830,7 @@ def submit_package(package_path: str):
 
         print("Opening PR...")
         result = subprocess.run(
-            ["gh", "pr", "create",
+            gh_cmd + ["pr", "create",
              "--repo", YAPM_CONTRIB_REPO,
              "--title", f"add {pkg.stem}",
              "--body", f"Submit `{pkg.name}` to yapm-contrib."],
@@ -2254,6 +3015,8 @@ def main():
                            help="Skip confirmation prompt")
     p_install.add_argument("-n", "--dry-run", action="store_true",
                            help="Show what would be installed without making changes")
+    p_install.add_argument("-H", "--hall", type=str, default=None, metavar="NAME",
+                           help="Only use mirrors from the named hall (see 'yapm hall add')")
 
     # remove
     p_remove = sub.add_parser(
@@ -2303,7 +3066,7 @@ def main():
                           help="Search term (matched against name and description)")
 
     # update
-    sub.add_parser(
+    p_update = sub.add_parser(
         "update",
         help="Refresh the package index from all mirrors",
         description="Fetch and merge package lists from all configured mirrors into a local\n"
@@ -2311,6 +3074,8 @@ def main():
                     "and native YAPM (index.json) mirror formats.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p_update.add_argument("-H", "--hall", type=str, default=None, metavar="NAME",
+                          help="Only update from mirrors in the named hall (see 'yapm hall add')")
     # upgrade
     p_upgrade = sub.add_parser(
         "upgrade",
@@ -2344,6 +3109,43 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # fetch-count
+    sub.add_parser(
+        "fetch-count",
+        help="Print package count for neofetch/fastfetch",
+        description="Output the number of installed packages in a format suitable\n"
+                    "for neofetch/fastfetch package display lines.\n\n"
+                    "Example neofetch config:\n"
+                    "  info \"Packages\" fetch-count",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # completions
+    p_completions = sub.add_parser(
+        "completions",
+        help="Generate shell completion scripts",
+        description="Output a shell completion script for yapm.\n\n"
+                    "Usage:\n"
+                    "  eval \"$(yapm completions bash)\"   # bash (~/.bashrc)\n"
+                    "  eval \"$(yapm completions zsh)\"    # zsh (~/.zshrc)\n"
+                    "  yapm completions fish | source     # fish (~/.config/fish/config.fish)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_completions.add_argument("shell", choices=["bash", "zsh", "fish"],
+                                help="Shell to generate completions for")
+
+    # setup
+    sub.add_parser(
+        "setup",
+        help="One-time setup: install completions and fetch-count",
+        description="Detects your shell and installs:\n"
+                    "  - Tab completion scripts\n"
+                    "  - Package count for neofetch/fastfetch\n\n"
+                    "Runs automatically after the first 'yapm install'.\n"
+                    "To re-run: rm /var/lib/yapm/.setup_done && yapm setup",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
     # uninstall
     sub.add_parser(
         "uninstall",
@@ -2354,29 +3156,31 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # init (riot only)
-    p_init = sub.add_parser(
-        "init",
-        help="Bootstrap the system by installing bash (riot mode)",
-        description="Ensure bash is installed on the system. Intended for first-run\n"
-                    "bootstrapping on Riot live ISOs. Requires yapm.riot to be enabled.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_init.add_argument("-r", "--root", type=str, default=None, metavar="PATH",
-                        help="Install to a different root directory (requires yapm.insroot)")
+    # riot (only available when yapm.riot is enabled)
+    if config_flag("yapm.riot"):
+        p_riot = sub.add_parser(
+            "riot",
+            help="Bootstrap the system by installing bash (riot mode)",
+            description="Ensure bash is installed on the system. Intended for first-run\n"
+                        "bootstrapping on Riot live ISOs. Requires yapm.riot to be enabled.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        p_riot.add_argument("-r", "--root", type=str, default=None, metavar="PATH",
+                            help="Install to a different root directory (requires yapm.insroot)")
 
     # build
     p_build = sub.add_parser(
         "build",
         help="Build a .yapm package from a source directory",
-        description="Package a directory into a distributable .yapm file (tar.zst format).\n"
-                    "The directory must contain a yapm.data manifest with at least:\n"
-                    "  [METADATA]  name = \"pkg\"  version = \"1.0.0\"\n"
-                    "The output file is written to the current working directory.",
+        description="Package a directory into a distributable .yapm file (tar.zst format).\n\n"
+                    "  yapm build <dir>      — build a package from <dir>/yapm.data\n"
+                    "  yapm build -f <dir>   — generate a template yapm.data in <dir>",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_build.add_argument("directory", metavar="DIR",
-                         help="Path to the directory containing package files and yapm.data")
+    p_build.add_argument("directory", metavar="DIR", nargs="?", default=".",
+                         help="Path to the directory (default: current directory)")
+    p_build.add_argument("-f", "--file", action="store_true",
+                         help="Generate a template yapm.data instead of building")
 
     # submit
     p_submit = sub.add_parser(
@@ -2502,11 +3306,85 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    mirror_sub.add_parser(
+        "show",
+        help="Show all packages available in the mirror index",
+        description="Display every package in the local index with version,\n"
+                    "description, author, and license.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # hall
+    p_hall = sub.add_parser(
+        "hall",
+        help="Manage mirror groups (halls)",
+        description="A hall is a named group of mirrors. Use halls to quickly\n"
+                    "switch between mirror subsets when installing or updating.\n\n"
+                    "Mirror indices match 'yapm mirror list' output.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    hall_sub = p_hall.add_subparsers(dest="hall_cmd", required=True, metavar="<subcommand>")
+
+    h_add = hall_sub.add_parser(
+        "add",
+        help="Create a hall from mirror indices",
+        description="Select mirrors by range (1-3) or pinpoint ([1,5]) and\n"
+                    "save them under a name.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    h_add.add_argument("selection", metavar="SELECTION",
+                        help="Mirror selection: 1-3 (range), [1,5] (pinpoint), or 3 (single)")
+    h_add.add_argument("name", metavar="NAME",
+                        help="Name for this hall")
+
+    hall_sub.add_parser(
+        "list",
+        help="List all halls",
+        description="Print all defined halls with their mirror count.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    h_remove = hall_sub.add_parser(
+        "remove",
+        help="Remove a hall by name",
+        description="Delete a hall. Does not remove the mirrors themselves.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    h_remove.add_argument("name", metavar="NAME",
+                           help="Name of the hall to remove")
+
+    h_show = hall_sub.add_parser(
+        "show",
+        help="Show mirrors in a hall",
+        description="List all mirrors belonging to a named hall.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    h_show.add_argument("name", metavar="NAME",
+                         help="Name of the hall to inspect")
+
+    # su
+    p_su = sub.add_parser(
+        "su",
+        help="Set up passwordless sudo for yapm (like Tailscale)",
+        description="One-time setup: creates a sudoers rule so yapm never needs sudo again.\n\n"
+                    "  yapm su              — set up passwordless sudo (run once)\n"
+                    "  yapm su <cmd> [args] — re-run a yapm command with sudo\n\n"
+                    "Creates /etc/sudoers.d/yapm-<user> so yapm can run as root\n"
+                    "without prompting for a password.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_su.add_argument("extra", nargs=argparse.REMAINDER,
+                       metavar="...",
+                       help="Command and arguments to re-run as root (optional)")
+
     args = parser.parse_args()
 
-    if args.command != "submit":
-        require_root()
-        ensure_dirs()
+    if args.command not in ("submit", "su", "completions", "fetch-count", "version", "setup", "list"):
+        if args.command == "build" and getattr(args, "file", False):
+            pass  # template generation doesn't need root
+        else:
+            require_root()
+            ensure_dirs()
 
     try:
         if config_flag("yapm.yapm"):
@@ -2526,7 +3404,7 @@ def main():
 
 def _dispatch(args):
     if args.command == "install":
-        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm, dry_run=args.dry_run)
+        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm, dry_run=args.dry_run, hall=args.hall)
     elif args.command == "remove":
         remove_package(args.package, noconfirm=args.noconfirm)
     elif args.command == "list":
@@ -2536,13 +3414,18 @@ def _dispatch(args):
     elif args.command == "search":
         search_package(args.term)
     elif args.command == "update":
-        update_index()
+        update_index(hall=args.hall)
     elif args.command == "upgrade":
         upgrade_packages(refresh=args.refresh, dry_run=args.dry_run)
     elif args.command == "build":
-        build_package(args.directory)
+        if args.file:
+            generate_yapm_data(args.directory)
+        else:
+            build_package(args.directory)
     elif args.command == "submit":
         submit_package(args.package)
+    elif args.command == "su":
+        su_exec(args.extra)
     elif args.command == "outdated":
         outdated_packages()
     elif args.command == "files":
@@ -2564,9 +3447,15 @@ def _dispatch(args):
             with open(CONFIG_FILE) as f:
                 cv = json.load(f).get("version", "unknown")
             print(f"config version {cv}")
+    elif args.command == "fetch-count":
+        fetch_count()
+    elif args.command == "completions":
+        completions_generate(args.shell)
+    elif args.command == "setup":
+        setup()
     elif args.command == "uninstall":
         uninstall_yapm()
-    elif args.command == "init":
+    elif args.command == "riot":
         init_package(root=args.root)
     elif args.command == "fetch":
         update_yapm(force=args.force)
@@ -2581,6 +3470,18 @@ def _dispatch(args):
             mirror_test()
         elif args.mirror_cmd == "list":
             mirror_list()
+        elif args.mirror_cmd == "show":
+            mirror_show()
+
+    elif args.command == "hall":
+        if args.hall_cmd == "add":
+            hall_add(args.selection, args.name)
+        elif args.hall_cmd == "list":
+            hall_list()
+        elif args.hall_cmd == "remove":
+            hall_remove(args.name)
+        elif args.hall_cmd == "show":
+            hall_show(args.name)
 
     elif args.command == "config":
         if args.config_cmd == "list":

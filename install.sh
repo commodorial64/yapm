@@ -52,4 +52,7 @@ if [ -n "$CURRENT_YAPM" ] && [ "$CURRENT_YAPM" != "$INSTALL_BIN" ]; then
     echo "You might want to remove it: sudo rm $CURRENT_YAPM"
 fi
 
+# Run first-time setup (completions + fetch-count)
+"$INSTALL_BIN" setup 2>/dev/null || true
+
 echo -e "\nRun 'sudo yapm version' to verify installation."
