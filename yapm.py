@@ -296,7 +296,7 @@ _yapm() {
                         '-n[Dry run]' \
                         '--dry-run[Dry run]' \
                         '-f[Package format]:format:(yapm deb arch)' \
-                        '*:package:_files -g "*.yapm -o *.deb -o *.pkg.tar.zst"' && ret=0
+                        '*:package:_files -g "*.(yapm|deb|pkg.tar.zst)"' && ret=0
                     ;;
                 remove)
                     _arguments '-y[Skip confirmation]' '--noconfirm[Skip confirmation]' '*:package:_yapm_installed' && ret=0
