@@ -137,34 +137,27 @@ def require_root():
 def su_exec(extra_args: List[str]):
     """Set up passwordless sudo for yapm via a sudoers drop-in rule.
 
-    run once with sudo, then yapm never needs sudo again.
-    +Creates /etc/sudoers.d/yapm-<user> allowing the current user to run
+    Like Tailscale: run once with sudo, then yapm never needs sudo again.
+    Creates /etc/sudoers.d/yapm-<user> allowing the current user to run
     yapm as root without a password.
     """
     if os.getuid() == 0:
-        print("Already running as root.")
-        sys.exit(0)
+        # Running as root — write the sudoers rule
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+        if not user or user == "root":
+            print("Error: could not determine original user.")
+            sys.exit(1)
 
-    user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-    if not user or user == "root":
-        print("Error: could not determine current user.")
-        sys.exit(1)
+        yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
+        rule = f"{user} ALL=(root) NOPASSWD: {yapm_path} *\\n"
+        rule_file = Path(f"/etc/sudoers.d/yapm-{user}")
 
-    yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
-    rule = f"{user} ALL=(root) NOPASSWD: {yapm_path} *\\n"
-    rule_file = Path(f"/etc/sudoers.d/yapm-{user}")
+        if rule_file.exists():
+            existing = rule_file.read_text()
+            if yapm_path in existing:
+                print(f"yapm is already set up for passwordless use ({rule_file}).")
+                sys.exit(0)
 
-    if rule_file.exists():
-        existing = rule_file.read_text()
-        if yapm_path in existing:
-            print(f"yapm is already set up for passwordless use ({rule_file}).")
-            if extra_args:
-                print("Re-executing with elevated privileges...")
-                os.execvp("sudo", ["sudo", yapm_path] + extra_args)
-            sys.exit(0)
-
-    if not extra_args:
-        print(f"Creating sudoers rule for {user}...")
         rule_file.write_text(rule)
         rule_file.chmod(0o440)
 
@@ -178,10 +171,13 @@ def su_exec(extra_args: List[str]):
         print(f"Done. {user} can now run yapm without sudo.")
         print(f"  Rule: {rule_file}")
         print("  You may need to open a new shell for changes to take effect.")
-    else:
-        cmd = ["sudo", yapm_path] + extra_args
-        print(f"Re-executing with sudo: {' '.join(extra_args)}")
-        os.execvp("sudo", cmd)
+        sys.exit(0)
+
+    # Not root — re-exec with sudo
+    yapm_path = shutil.which("yapm") or str(Path(__file__).resolve())
+    cmd = ["sudo", yapm_path, "su"] + extra_args
+    print("Re-executing with sudo...")
+    os.execvp("sudo", cmd)
 
 # ============================================================
 # SHELL COMPLETIONS
