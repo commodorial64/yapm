@@ -3559,4 +3559,8 @@ def _dispatch(args):
             yapm_config_disable(args.flag)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
