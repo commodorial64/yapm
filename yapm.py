@@ -127,6 +127,20 @@ DEFAULT_CONFIG = {
     ]
 }
 
+def _pager(lines: List[str]):
+    """Pipe a list of lines through a pager (less), or print directly if unavailable/TTY is a pipe."""
+    if not sys.stdout.isatty():
+        for line in lines:
+            print(line)
+        return
+    pager = os.environ.get("PAGER", "less -R")
+    try:
+        proc = subprocess.Popen(pager, shell=True, stdin=subprocess.PIPE, text=True)
+        proc.communicate(input="\n".join(lines) + "\n")
+    except Exception:
+        for line in lines:
+            print(line)
+
 def require_root():
     """Abort immediately if not running as root."""
     if os.getuid() != 0:
@@ -1087,7 +1101,7 @@ def mirror_preset():
     save_config(DEFAULT_CONFIG)
     print("Restored default mirrors.")
 
-def mirror_show():
+def mirror_show(hall: Optional[str] = None, mirror_filter: Optional[str] = None):
     idx = load_index()
     packages = idx.get("packages", {})
     if not packages:
@@ -1096,12 +1110,28 @@ def mirror_show():
 
     db = load_db()
 
+    # resolve hall to a set of mirror URLs
+    hall_urls = set()
+    if hall:
+        config = load_config()
+        halls = config.get("halls", {})
+        if hall not in halls:
+            print(f"Hall '{hall}' not found. Available halls: {', '.join(sorted(halls.keys())) or '(none)'}")
+            return
+        hall_urls = set(halls[hall])
+
     # determine column widths from the data
     name_ver_parts = []
     for pkg_key, formats_entry in packages.items():
         for fmt_name in ("yapm", "arch", "deb", "nix"):
             entry = formats_entry.get(fmt_name)
             if not entry:
+                continue
+            # filter by hall or mirror
+            pkg_mirror = entry.get("mirror", "")
+            if hall_urls and pkg_mirror not in hall_urls:
+                continue
+            if mirror_filter and mirror_filter not in pkg_mirror:
                 continue
             if "versions" in entry:
                 latest = entry.get("latest", "")
@@ -1111,8 +1141,14 @@ def mirror_show():
             name_ver_parts.append(ver_str)
             break
 
+    if not name_ver_parts:
+        label = f"hall '{hall}'" if hall else f"mirror '{mirror_filter}'" if mirror_filter else "index"
+        print(f"No packages found for {label}.")
+        return
+
     col1_width = max((len(s) for s in name_ver_parts), default=30) + 4
 
+    lines = []
     for pkg_key in sorted(packages):
         formats_entry = packages[pkg_key]
         entry = None
@@ -1123,6 +1159,13 @@ def mirror_show():
                 fmt_name = fmt
                 break
         if not entry:
+            continue
+
+        # filter by hall or mirror
+        pkg_mirror = entry.get("mirror", "")
+        if hall_urls and pkg_mirror not in hall_urls:
+            continue
+        if mirror_filter and mirror_filter not in pkg_mirror:
             continue
 
         if "versions" in entry:
@@ -1149,9 +1192,10 @@ def mirror_show():
         if pkg_key in db:
             installed_mark = f" {Color.GREEN}[installed]{Color.RESET}"
 
-        print(f"{Color.BOLD}{left}{Color.RESET}{padding}{desc_display}{installed_mark}")
-        detail = f"  {Color.DIM}{author}  {license_}{Color.RESET}"
-        print(detail)
+        lines.append(f"{Color.BOLD}{left}{Color.RESET}{padding}{desc_display}{installed_mark}")
+        lines.append(f"  {Color.DIM}{author}  {license_}{Color.RESET}")
+
+    _pager(lines)
 
 def parse_selection(sel: str, mirrors: List[Dict]) -> List[Dict]:
     """Parse a mirror selection string and return the matching mirrors.
@@ -3316,13 +3360,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    mirror_sub.add_parser(
+    m_show = mirror_sub.add_parser(
         "show",
         help="Show all packages available in the mirror index",
         description="Display every package in the local index with version,\n"
-                    "description, author, and license.",
+                    "description, author, and license.\n\n"
+                    "Optionally filter by hall name or mirror URL substring.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    m_show.add_argument("filter", nargs="?", default=None, metavar="hall|mirror",
+                        help="Hall name or mirror URL substring to filter by")
 
     # hall
     p_hall = sub.add_parser(
@@ -3481,7 +3528,17 @@ def _dispatch(args):
         elif args.mirror_cmd == "list":
             mirror_list()
         elif args.mirror_cmd == "show":
-            mirror_show()
+            f = getattr(args, "filter", None)
+            # if it looks like a hall name (no dots/slashes), try hall first
+            hall = None
+            mirror_filter = None
+            if f:
+                config = load_config()
+                if f in config.get("halls", {}):
+                    hall = f
+                else:
+                    mirror_filter = f
+            mirror_show(hall=hall, mirror_filter=mirror_filter)
 
     elif args.command == "hall":
         if args.hall_cmd == "add":
