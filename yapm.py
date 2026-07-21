@@ -137,7 +137,7 @@ def require_root():
 def su_exec(extra_args: List[str]):
     """Set up passwordless sudo for yapm via a sudoers drop-in rule.
 
-    Like Tailscale: run once with sudo, then yapm never needs sudo again.
+    run once with sudo, then yapm never needs sudo again.
     Creates /etc/sudoers.d/yapm-<user> allowing the current user to run
     yapm as root without a password.
     """
@@ -3361,7 +3361,7 @@ def main():
     # su
     p_su = sub.add_parser(
         "su",
-        help="Set up passwordless sudo for yapm (like Tailscale)",
+        help="Set up passwordless sudo for yapm",
         description="One-time setup: creates a sudoers rule so yapm never needs sudo again.\n\n"
                     "  yapm su              — set up passwordless sudo (run once)\n"
                     "  yapm su <cmd> [args] — re-run a yapm command with sudo\n\n"
