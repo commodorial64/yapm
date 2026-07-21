@@ -323,7 +323,7 @@ _yapm() {
 
 _yapm_installed() {
     local -a pkgs
-    pkgs=(${(f)"$(yapm list --json 2>/dev/null | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin).keys()))' 2>/dev/null)})
+    pkgs=(${(f)"$(yapm list --json 2>/dev/null | python3 -c 'import sys,json; print("\\n".join(json.load(sys.stdin).keys()))' 2>/dev/null)"})
     _describe 'installed package' pkgs
 }
 
@@ -419,8 +419,17 @@ def completions_generate(shell: str):
 SETUP_MARKER = DATA_DIR / ".setup_done"
 
 def _detect_shell() -> str:
-    """Detect the user's shell from $SHELL."""
-    shell_path = os.environ.get("SUDO_USER") and f"/etc/passwd"  # unused, keep simple
+    """Detect the user's shell, using /etc/passwd when running via sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            name = Path(pw.pw_shell).name
+            if name in ("bash", "zsh", "fish"):
+                return name
+        except (KeyError, ImportError):
+            pass
     full = os.environ.get("SHELL", "")
     name = Path(full).name if full else ""
     if name in ("bash", "zsh", "fish"):
@@ -604,6 +613,15 @@ def setup():
         _install_completions_fish(yapm_path)
 
     _install_fetch_count(shell)
+
+    # rebuild zsh completion cache so new completions are picked up
+    if shell == "zsh":
+        user_home = _user_home()
+        for f in user_home.glob(".zcompdump*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
     # make installed.json world-readable so neofetch/fastfetch can count packages
     try:
