@@ -417,7 +417,6 @@ def completions_generate(shell: str):
     print(scripts[shell])
 
 SETUP_MARKER = DATA_DIR / ".setup_done"
-SETUP_MARKER_USER = Path.home() / ".yapm" / ".setup_done"
 
 def _detect_shell() -> str:
     """Detect the user's shell from $SHELL."""
@@ -436,6 +435,13 @@ def _detect_user() -> str:
             return u
     return "root"
 
+def _user_home() -> Path:
+    """Get the real user's home directory (resolves through SUDO_USER)."""
+    user = _detect_user()
+    if user != "root":
+        return Path(f"/home/{user}")
+    return Path.home()
+
 def _install_completions_bash(yapm_path: str):
     script = _BASH_COMPLETION
     # system-wide
@@ -445,11 +451,7 @@ def _install_completions_bash(yapm_path: str):
         print(f"  Installed bash completions → {sys_dir / 'yapm'}")
         return
     # user-local fallback
-    user = _detect_user()
-    if user != "root":
-        local_dir = Path(f"/home/{user}/.local/share/bash-completion/completions")
-    else:
-        local_dir = Path.home() / ".local/share/bash-completion/completions"
+    local_dir = _user_home() / ".local/share/bash-completion/completions"
     local_dir.mkdir(parents=True, exist_ok=True)
     (local_dir / "yapm").write_text(script)
     print(f"  Installed bash completions → {local_dir / 'yapm'}")
@@ -463,16 +465,12 @@ def _install_completions_zsh(yapm_path: str):
         print(f"  Installed zsh completions → {sys_dir / '_yapm'}")
         return
     # user-local fallback
-    user = _detect_user()
-    if user != "root":
-        local_dir = Path(f"/home/{user}/.zsh/functions")
-    else:
-        local_dir = Path.home() / ".zsh/functions"
+    local_dir = _user_home() / ".zsh/functions"
     local_dir.mkdir(parents=True, exist_ok=True)
     (local_dir / "_yapm").write_text(script)
     print(f"  Installed zsh completions → {local_dir / '_yapm'}")
     # add to fpath in .zshrc if not already there
-    zshrc = Path.home() / ".zshrc"
+    zshrc = _user_home() / ".zshrc"
     fpath_line = f'fpath=({local_dir} $fpath)'
     if zshrc.exists() and fpath_line in zshrc.read_text():
         return
@@ -489,11 +487,7 @@ def _install_completions_fish(yapm_path: str):
         print(f"  Installed fish completions → {sys_dir / 'yapm.fish'}")
         return
     # user-local fallback
-    user = _detect_user()
-    if user != "root":
-        local_dir = Path(f"/home/{user}/.config/fish/completions")
-    else:
-        local_dir = Path.home() / ".config/fish/completions"
+    local_dir = _user_home() / ".config/fish/completions"
     local_dir.mkdir(parents=True, exist_ok=True)
     (local_dir / "yapm.fish").write_text(script)
     print(f"  Installed fish completions → {local_dir / 'yapm.fish'}")
@@ -538,7 +532,7 @@ def _patch_fastfetch():
     if not fastfetch_path:
         return
 
-    config_file = Path.home() / ".config/fastfetch/config.jsonc"
+    config_file = _user_home() / ".config/fastfetch/config.jsonc"
     config_file.parent.mkdir(parents=True, exist_ok=True)
 
     # read existing or create default
@@ -592,7 +586,8 @@ def _patch_fastfetch():
 
 def setup():
     """One-time setup: install shell completions and fetch-count integration."""
-    if SETUP_MARKER.exists() or SETUP_MARKER_USER.exists():
+    marker_user = _user_home() / ".yapm" / ".setup_done"
+    if SETUP_MARKER.exists() or marker_user.exists():
         print("yapm is already set up. To re-run: rm ~/.yapm/.setup_done && yapm setup")
         return
 
@@ -617,12 +612,13 @@ def setup():
     except (OSError, PermissionError):
         pass
 
-    for marker in (SETUP_MARKER, SETUP_MARKER_USER):
+    for marker in (SETUP_MARKER, marker_user):
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps({"shell": shell, "user": _detect_user()}))
         except (OSError, PermissionError):
             pass
+
     print(f"\nSetup complete. Open a new shell or run 'source ~/.{shell}rc' to activate.")
 
 
@@ -2143,7 +2139,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
     if config_flag("yapm.yapm"):
         print("something may or may have gone wrong. who can say really")
 
-    if not SETUP_MARKER.exists() and not SETUP_MARKER_USER.exists():
+    if not SETUP_MARKER.exists() and not (_user_home() / ".yapm" / ".setup_done").exists():
         try:
             setup()
         except Exception:
