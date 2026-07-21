@@ -73,7 +73,7 @@ def _parse_ver(v: str):
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
