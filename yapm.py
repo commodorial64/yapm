@@ -51,12 +51,33 @@ _COLOR_ENABLED = sys.stdout.isatty()
 class Color:
     RESET   = "\033[0m"  if _COLOR_ENABLED else ""
     BOLD    = "\033[1m"   if _COLOR_ENABLED else ""
+    DIM     = "\033[2m"   if _COLOR_ENABLED else ""
+    UNDER   = "\033[4m"   if _COLOR_ENABLED else ""
     RED     = "\033[31m"  if _COLOR_ENABLED else ""
     GREEN   = "\033[32m"  if _COLOR_ENABLED else ""
     YELLOW  = "\033[33m"  if _COLOR_ENABLED else ""
     BLUE    = "\033[34m"  if _COLOR_ENABLED else ""
+    MAGENTA = "\033[35m"  if _COLOR_ENABLED else ""
     CYAN    = "\033[36m"  if _COLOR_ENABLED else ""
-    DIM     = "\033[2m"   if _COLOR_ENABLED else ""
+    WHITE   = "\033[37m"  if _COLOR_ENABLED else ""
+    BG_RED  = "\033[41m"  if _COLOR_ENABLED else ""
+    BROWN   = "\033[38;2;160;120;90m" if _COLOR_ENABLED else ""
+    DEB_RED = "\033[38;2;170;33;33m"  if _COLOR_ENABLED else ""
+    ARCH_BLUE = "\033[38;2;23;147;209m" if _COLOR_ENABLED else ""
+    YAPM_BROWN = "\033[38;2;160;120;90m" if _COLOR_ENABLED else ""
+
+def _pkg(name):      return f"{Color.BOLD}{name}{Color.RESET}"
+def _ver(v):         return f"{Color.DIM}{v}{Color.RESET}"
+def _ok(msg):        return f"{Color.GREEN}{msg}{Color.RESET}"
+def _warn(msg):      return f"{Color.YELLOW}{msg}{Color.RESET}"
+def _err(msg):       return f"{Color.RED}{msg}{Color.RESET}"
+def _info(msg):      return f"{Color.CYAN}{msg}{Color.RESET}"
+def _action(msg):    return f"{Color.BOLD}{Color.CYAN}::{Color.RESET} {msg}"
+def _title(msg):     return f"{Color.BOLD}{msg}{Color.RESET}"
+def _fmt(fmt_name):
+    colors = {"deb": Color.DEB_RED, "arch": Color.ARCH_BLUE, "yapm": Color.YAPM_BROWN, "nix": Color.MAGENTA}
+    c = colors.get(fmt_name, Color.CYAN)
+    return f"{c}{fmt_name.upper()}{Color.RESET}"
 
 
 def _parse_ver(v: str):
@@ -73,7 +94,7 @@ def _parse_ver(v: str):
 # CONFIGURATION PATHS
 # ============================================================
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 CURRENT_VERSION = 1  # Config version
 
 # yapm always runs as root — all paths are system-wide
@@ -114,8 +135,41 @@ KNOWN_FLAGS = {
     "yapm.paranoid": False,
     "yapm.dangerzone": False,
     "yapm.nativenationality": False,
+    "yapm.fuckaround": False,
     "yapm.yapm": False,
 }
+
+_DEB_DISTROS = {"debian", "ubuntu", "linuxmint", "pop", "kali", "raspbian", "deepin", "elementary", "zorin"}
+_ARCH_DISTROS = {"arch", "endeavouros", "manjaro", "garuda", "arco"}
+
+def _detect_host_distro() -> str:
+    """Read /etc/os-release to detect the host distribution family."""
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    return line.split("=", 1)[1].strip().strip('"').lower()
+    except Exception:
+        pass
+    return ""
+
+def _check_cross_distro(fmt: str):
+    """Block installing packages from an incompatible distro format."""
+    if config_flag("yapm.fuckaround"):
+        return
+    host = _detect_host_distro()
+    if not host:
+        return
+    if fmt == "deb" and host not in _DEB_DISTROS:
+        print(f"BLOCKED: Installing Debian packages on {host} is NOT recommended.")
+        print("Trust me, I fucked around. (And found out.) - commodore.")
+        print("Set yapm.fuckaround to true if you know about the config flags. but i'd NOTTTTTT reccomend.")
+        sys.exit(1)
+    if fmt == "arch" and host not in _ARCH_DISTROS:
+        print(f"BLOCKED: I can't really tell you what'd happen if you installed")
+        print(f"an Arch package on {host}, but don't try it. - commodore.")
+        print("Set yapm.fuckaround to true if you know about the config flags. but i'd NOTTTTTT reccomend.")
+        sys.exit(1)
 
 DEFAULT_CONFIG = {
     "version": CURRENT_VERSION,
@@ -907,7 +961,7 @@ def download(url: str, desc: str = "Downloading", silent_errors: bool = False) -
                         
                         sz_str = f"{downloaded/1048576:.1f}/{size/1048576:.1f}MB" if size > 1048576 else f"{downloaded/1024:.0f}/{size/1024:.0f}KB"
                         
-                        print(f"\r\033[K{brown}/yapm > {desc} [{bar}] {percent:3d}%{reset} \033[38;5;242m({sz_str})\033[0m", end="", flush=True)
+                        print(f"\r\033[K{Color.CYAN}{desc}{Color.RESET} [{brown}{bar}{Color.RESET}] {Color.GREEN}{percent:3d}%{Color.RESET} {Color.DIM}({sz_str}){Color.RESET}", end="", flush=True)
                 
                 if interrupted or (size > 0 and downloaded < size):
                     if attempt < max_retries - 1:
@@ -1190,10 +1244,10 @@ def mirror_show(hall: Optional[str] = None, mirror_filter: Optional[str] = None)
 
         installed_mark = ""
         if pkg_key in db:
-            installed_mark = f" {Color.GREEN}[installed]{Color.RESET}"
+            installed_mark = f" {_ok('[installed]')}"
 
-        lines.append(f"{Color.BOLD}{left}{Color.RESET}{padding}{desc_display}{installed_mark}")
-        lines.append(f"  {Color.DIM}{author}  {license_}{Color.RESET}")
+        lines.append(f"  {_pkg(left)}{padding}{Color.DIM}{desc_display}{Color.RESET}{installed_mark}")
+        lines.append(f"    {Color.DIM}{author}  {license_}{Color.RESET}")
 
     _pager(lines)
 
@@ -1418,22 +1472,49 @@ def parse_debian_index(mirror_url: str, merged_index: dict):
             content = gz.read().decode('utf-8', errors='ignore')
             
         current_pkg = {}
+        depends_continuation = False
         for line in content.splitlines():
+            if line.startswith(" ") or line.startswith("\t"):
+                # continuation line (e.g. multi-line Depends)
+                if depends_continuation and current_pkg is not None:
+                    current_pkg.setdefault("depends_raw", []).append(line.strip())
+                continue
+
+            depends_continuation = False
+
             if not line.strip():
                 if current_pkg and "name" in current_pkg:
                     name = current_pkg["name"]
+                    # Parse deb Depends: "pkg (>= ver), pkg2 | pkg3"
+                    deps = []
+                    for dep_str in current_pkg.get("depends_raw", []):
+                        for part in dep_str.split(","):
+                            # Take first alternative, drop version constraints
+                            pkg_name = part.split("|")[0].strip().split("(")[0].strip()
+                            # Skip virtual packages, alternatives markers, pre-deps
+                            if pkg_name and not pkg_name.startswith("<") and pkg_name not in ("preinst", "postinst", "prerm", "postrm", "dpkg"):
+                                deps.append(pkg_name)
                     merged_index["packages"].setdefault(name, {})["deb"] = {
                         "version": current_pkg.get("version", "0.0.0"),
                         "mirror": mirror_url,
                         "format": "deb",
-                        "download_path": current_pkg.get("filename", "")
+                        "download_path": current_pkg.get("filename", ""),
+                        "dependencies": deps,
                     }
                 current_pkg = {}
                 continue
                 
-            if line.startswith("Package: "): current_pkg["name"] = line.split(":", 1)[1].strip()
+            if line.startswith("Package: "):
+                current_pkg = {"depends_raw": []}
+                current_pkg["name"] = line.split(":", 1)[1].strip()
             elif line.startswith("Version: "): current_pkg["version"] = line.split(":", 1)[1].strip()
             elif line.startswith("Filename: "): current_pkg["filename"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Depends: "):
+                current_pkg.setdefault("depends_raw", []).append(line.split(":", 1)[1].strip())
+                depends_continuation = True
+            elif line.startswith("Pre-Depends: "):
+                current_pkg.setdefault("depends_raw", []).append(line.split(":", 1)[1].strip())
+                depends_continuation = True
     except Exception as e:
         print(f"Error parsing Debian index: {e}")
 
@@ -1588,11 +1669,11 @@ def update_index(hall: Optional[str] = None):
         print("found 0 updates")
         time.sleep(1)
         print("just kidding")
-    print("Updating package index...")
+    print(f"  {_action('updating package index')}...")
     merged_index = {"packages": {}}
     mirrors = resolve_hall(hall) if hall else sorted_mirrors()
     if hall:
-        print(f"  (filtered to hall '{hall}' — {len(mirrors)} mirror(s))")
+        print(f"    {Color.DIM}(filtered to hall '{hall}' — {len(mirrors)} mirror(s)){Color.RESET}")
     for mirror in mirrors:
         url = mirror["url"]
         if "ubuntu.com" in url or "debian.org" in url:
@@ -1635,7 +1716,7 @@ def update_index(hall: Optional[str] = None):
 
     with open(INDEX_FILE, "w") as f:
         json.dump(merged_index, f, indent=4)
-    print("Index updated.")
+    print(f"  {_ok('Index updated.')}")
 
 def load_index() -> Dict:
     if not INDEX_FILE.exists():
@@ -1683,7 +1764,33 @@ def fetch_from_github(pkg_name: str, repo: str, version: Optional[str]) -> Optio
 
 def fetch_package(pkg: str, mirror_url: Optional[str] = None, version: Optional[str] = None, arch_mode: bool = False, hall: Optional[str] = None) -> Optional[bytes]:
     idx = load_index()
-    pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
+    packages = idx.get("packages", {})
+    pkg_entry = packages.get(pkg, {})
+
+    # when a mirror is explicitly pinned, find the format that belongs to it
+    if mirror_url and pkg_entry:
+        matched_fmt = None
+        for fmt in ("yapm", "arch", "deb", "nix"):
+            sub = pkg_entry.get(fmt)
+            if sub and sub.get("mirror", "") == mirror_url:
+                matched_fmt = fmt
+                break
+        if matched_fmt:
+            pkg_info = dict(pkg_entry[matched_fmt])
+            if "versions" in pkg_info:
+                ver = version or pkg_info.get("latest", "0.0.0")
+                ver_info = pkg_info["versions"].get(ver, {})
+                pkg_info = dict(ver_info)
+                pkg_info["version"] = ver
+                pkg_info["format"] = matched_fmt
+                pkg_info["mirror"] = mirror_url
+            else:
+                pkg_info["format"] = matched_fmt
+        else:
+            pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
+    else:
+        pkg_info = get_pkg_info(idx, pkg, version, arch_mode=arch_mode)
+
     fmt = "arch" if arch_mode else (pkg_info or {}).get("format", "yapm")
     base = pkg_basename(pkg)
 
@@ -1754,11 +1861,12 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
         print("yapm.nativenationality is enabled — only native .yapm packages allowed")
         sys.exit(1)
 
+    _check_cross_distro(fmt)
+
     # Determine extraction target:
     # - .yapm packages always go to sandbox (they have manifests)
-    # - arch/deb extract to ROOT_DIR when --root is set (respect native prefix)
-    # - arch/deb stay in sandbox when running on host (safety)
-    use_root = fmt in ("arch", "deb") and str(ROOT_DIR) != "/"
+    # - arch/deb always extract to ROOT_DIR (they're self-contained filesystem trees)
+    use_root = fmt in ("arch", "deb")
     file_list: List[str] = []
 
     if use_root:
@@ -1847,11 +1955,12 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                 subprocess.run([str(extract_target / post_install)], cwd=extract_target, check=True)
         else:
             # Fallback for .yapm without manifest
-            bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
+            bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin",
+                               extract_target / "usr" / "games", extract_target / "usr" / "sbin"]
             for src_dir in bin_source_dirs:
                 if src_dir.exists() and src_dir.is_dir():
                     for item in src_dir.iterdir():
-                        if item.is_file() and os.access(item, os.X_OK):
+                        if (item.is_file() or item.is_symlink()) and os.access(item, os.X_OK):
                             dest = BIN_DIR / item.name
                             if dest.exists() or dest.is_symlink():
                                 os.unlink(dest)
@@ -1872,6 +1981,22 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             file_list = get_arch_file_list(data)
         else:
             file_list = get_deb_file_list(data)
+
+        # Link executables from non-standard bin dirs to /usr/local/bin
+        _standard_bin = {"/bin", "/usr/bin", "/sbin", "/usr/sbin"}
+        for fpath in file_list:
+            full = ROOT_DIR / (fpath[2:] if fpath.startswith("./") else fpath)
+            parent = str(full.parent)
+            if parent not in _standard_bin and full.exists() and (full.is_file() or full.is_symlink()) and os.access(full, os.X_OK):
+                dest = BIN_DIR / full.name
+                if dest.is_symlink() and not dest.exists():
+                    dest.unlink(missing_ok=True)
+                if not dest.exists() and not dest.is_symlink():
+                    try:
+                        os.symlink(full, dest)
+                        print(f"  Linked {full.name} -> {dest}")
+                    except Exception:
+                        pass
 
         # Extract metadata from the package
         if fmt == "arch":
@@ -1914,11 +2039,12 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             except Exception:
                 pass
 
-        bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin"]
+        bin_source_dirs = [extract_target / "src", extract_target / "usr" / "bin", extract_target / "bin",
+                           extract_target / "usr" / "games", extract_target / "usr" / "sbin"]
         for src_dir in bin_source_dirs:
             if src_dir.exists() and src_dir.is_dir():
                 for item in src_dir.iterdir():
-                    if item.is_file() and os.access(item, os.X_OK):
+                    if (item.is_file() or item.is_symlink()) and os.access(item, os.X_OK):
                         dest = BIN_DIR / item.name
                         if dest.exists() or dest.is_symlink():
                             os.unlink(dest)
@@ -1938,6 +2064,18 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                             symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
                             os.symlink(symlink_src, dest)
                             print(f"  Linked lib {item.name} -> {dest}")
+
+        # Also link usr/share subtree (data files, man pages, etc.)
+        share_src = extract_target / "usr" / "share"
+        if share_src.exists() and share_src.is_dir():
+            for item in share_src.iterdir():
+                dest = Path("/") / "usr" / "share" / item.name
+                if not dest.exists() and not dest.is_symlink():
+                    try:
+                        os.symlink(item, dest)
+                        print(f"  Linked share/{item.name} -> {dest}")
+                    except Exception:
+                        pass
 
         metadata_path = extract_target / "metadata.json"
         if metadata_path.exists():
@@ -2083,7 +2221,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         else:
             pkg_name = pkg_path.stem
 
-        print(f"Installing {local_fmt.upper()} from local file: {pkg_path}")
+        print(f"  {_action('installing')} {_pkg(pkg_name)} from local {Color.DIM}{pkg_path}{Color.RESET}")
         with open(pkg_path, "rb") as f:
             data = f.read()
         _install_single(pkg_name, db, data, local_fmt)
@@ -2096,14 +2234,16 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
                 db[pkg_name]["dependencies"] = pkginfo.get("depends", [])
                 db[pkg_name].setdefault("metadata", {})["description"] = pkginfo.get("pkgdesc", "")
                 save_db(db)
-        print(f"Installed {pkg_name} successfully.")
+        print(f"  {_action('installed')} {_pkg(pkg_name)}.")
 
     if not to_install_merged:
         if not local_installs:
-            print("Nothing to install.")
+            print(f"{_action('nothing to do')}")
         return
 
-    print(f"The following packages will be installed: {', '.join(to_install_merged)}")
+    print(f"{_action('resolving dependencies')}...")
+    pkg_list = ', '.join(_pkg(p) for p in to_install_merged)
+    print(f"  {pkg_list}")
 
     if config_flag("yapm.yapm"):
         chaos_confirm(3)
@@ -2133,9 +2273,21 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         p_mirror = pin_mirror.get(p)
         chaos_interrupt()
         display_p = chaos_wrong_name(p)
-        print(f"Installing {display_p}...")
+        print(f"  {_action('installing')} {_pkg(display_p)}...")
 
-        fetched_fmt = "arch" if arch_mode else (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
+        if arch_mode:
+            fetched_fmt = "arch"
+        elif p_mirror:
+            # when mirror is pinned, find the format that belongs to it
+            pkg_entry = idx.get("packages", {}).get(p, {})
+            fetched_fmt = "yapm"
+            for fmt in ("yapm", "arch", "deb", "nix"):
+                sub = pkg_entry.get(fmt)
+                if sub and sub.get("mirror", "") == p_mirror:
+                    fetched_fmt = fmt
+                    break
+        else:
+            fetched_fmt = (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
 
         if fetched_fmt == "nix":
             nix_info = (get_pkg_info(idx, p, p_ver) or {})
@@ -2156,7 +2308,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
                 "metadata": {"description": nix_info.get("description", "")}
             }
             save_db(db)
-            print(f"Installed {display_p}.")
+            print(f"  {_action('installed')} {_pkg(display_p)}.")
             continue
 
         if p in pre_fetched_data:
@@ -2188,14 +2340,14 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         needs_ldconfig = True
         if fetched_fmt == "arch" and config_flag("yapm.hooks"):
             run_pkg_install_hook(data, ROOT_DIR, "post_install")
-        print(f"Installed {chaos_wrong_name(p)}.")
+        print(f"  {_action('installed')} {_pkg(chaos_wrong_name(p))}.")
 
     if "linux" in to_install_merged and str(ROOT_DIR) != "/":
         print("Running mkinitcpio for bootstrapped system...")
         subprocess.run(["arch-chroot", str(ROOT_DIR), "mkinitcpio", "-P"], check=False)
 
     if needs_ldconfig:
-        print("Updating library cache...")
+        print(f"  {_action('updating library cache')}...")
         subprocess.run(["ldconfig"], capture_output=True, check=False)
 
     if config_flag("yapm.yapm"):
@@ -2215,12 +2367,12 @@ def remove_package(pkg: str, noconfirm: bool = False):
     pkg_key = pkg
 
     if pkg_key not in db:
-        print(f"Package '{pkg_key}' not installed.")
+        print(f"  {_err(f'Package {format_key(pkg_key)} not installed.')}")
         return
 
     if not noconfirm and not config_flag("yapm.noconfirm"):
         try:
-            choice = input(f"Remove {format_key(pkg_key)}? [y/N] ").strip().lower()
+            choice = input(f"  {_action('remove')} {_pkg(format_key(pkg_key))}? [{Color.GREEN}y{Color.RESET}/N] ").strip().lower()
             if choice not in ('y', 'yes'):
                 print("Aborted.")
                 return
@@ -2233,17 +2385,17 @@ def remove_package(pkg: str, noconfirm: bool = False):
 
     if fmt == "nix":
         attr_name = pkg_info.get("path", pkg_key)
-        print(f"Delegating removal to nix-env...")
+        print(f"  {_action('removing')} {_pkg(format_key(pkg_key))}...")
         result = subprocess.run(
             ["nix-env", "-e", pkg_key],
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            print(f"nix-env removal failed: {result.stderr.strip()}")
+            print(f"  {_err('nix-env removal failed')}: {result.stderr.strip()}")
             return
         del db[pkg_key]
         save_db(db)
-        print(f"Removed {format_key(pkg_key)}.")
+        print(f"  {_action('removed')} {_pkg(format_key(pkg_key))}.")
         return
 
     file_list = pkg_info.get("files", [])
@@ -2275,7 +2427,28 @@ def remove_package(pkg: str, noconfirm: bool = False):
                     d.rmdir()
             except OSError:
                 pass
-        print(f"Removed {format_key(pkg_key)} ({removed} files).")
+        print(f"  {_action('removed')} {_pkg(format_key(pkg_key))} ({removed} files).")
+        # Clean up any symlinks in BIN_DIR pointing into this package's tree
+        pkg_path = pkg_info.get("path", "")
+        if pkg_path and pkg_path != "/":
+            for link in BIN_DIR.iterdir():
+                if link.is_symlink():
+                    try:
+                        target = str(link.resolve())
+                        if target.startswith(str(Path(pkg_path))):
+                            link.unlink()
+                    except Exception:
+                        pass
+        else:
+            # For root-extracted packages, check against file_list
+            for link in BIN_DIR.iterdir():
+                if link.is_symlink():
+                    try:
+                        target = str(link.resolve())
+                        if any(str((Path("/") / f.lstrip("./")).resolve()) == target for f in file_list):
+                            link.unlink()
+                    except Exception:
+                        pass
     else:
         # Directory-based removal (sandbox packages)
         target = Path(pkg_info["path"])
@@ -2287,7 +2460,7 @@ def remove_package(pkg: str, noconfirm: bool = False):
                     dest = BIN_DIR / item.name
                     if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
                         os.unlink(dest)
-                        print(f"Removed link {dest}")
+                        print(f"  {_action('removed')} symlink {dest.name}")
 
         lib_source_dirs = [target / "usr" / "lib", target / "lib"]
         for src_dir in lib_source_dirs:
@@ -2298,10 +2471,10 @@ def remove_package(pkg: str, noconfirm: bool = False):
                             dest = LIB_DIR / item.name
                             if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
                                 os.unlink(dest)
-                                print(f"Removed lib link {dest}")
+                                print(f"  {_action('removed')} lib symlink {dest.name}")
 
         shutil.rmtree(target, ignore_errors=True)
-        print(f"Removed {format_key(pkg_key)}.")
+        print(f"  {_action('removed')} {_pkg(format_key(pkg_key))}.")
 
     del db[pkg_key]
     save_db(db)
@@ -2330,20 +2503,20 @@ def upgrade_packages(refresh: bool = False, dry_run: bool = False):
             to_upgrade.append((pkg, remote_ver))
 
     if not to_upgrade:
-        print("Everything is up to date.")
+        print(f"  {_ok('Everything is up to date.')}")
         return
 
-    print("The following packages will be upgraded:")
+    print(f"  {_action('upgrades available')}:")
     for pkg, ver in to_upgrade:
-        print(f"  {pkg} ({db[pkg].get('version', '0.0.0')} -> {ver})")
+        print(f"    {_pkg(pkg)} {_ver(db[pkg].get('version', '0.0.0'))} -> {_ok(ver)}")
 
     if dry_run:
-        print("(dry run — no changes made)")
+        print(f"\n  {Color.DIM}(dry run — no changes made){Color.RESET}")
         return
 
     for pkg, ver in to_upgrade:
         chaos_interrupt()
-        print(f"Upgrading {pkg}...")
+        print(f"  {_action('upgrading')} {_pkg(pkg)}...")
         installed_fmt = db[pkg].get("format", "yapm")
         if installed_fmt == "nix":
             idx_entry = (get_pkg_info(idx, pkg) or {})
@@ -2353,18 +2526,18 @@ def upgrade_packages(refresh: bool = False, dry_run: bool = False):
                 capture_output=True, text=True
             )
             if result.returncode != 0:
-                print(f"  nix-env failed: {result.stderr.strip()}. Skipping.")
+                print(f"    {_err('nix-env failed')}: {result.stderr.strip()}. Skipping.")
                 continue
             db[pkg]["version"] = ver
             save_db(db)
-            print(f"Upgraded {pkg}.")
+            print(f"  {_action('upgraded')} {_pkg(pkg)}.")
             continue
         data = fetch_package(pkg, version=ver)
         if not data:
-            print(f"Failed to fetch {pkg}. Skipping.")
+            print(f"    {_err('failed to fetch')} {_pkg(pkg)}. Skipping.")
             continue
         _install_single(pkg, db, data, installed_fmt)
-        print(f"Upgraded {pkg}.")
+        print(f"  {_action('upgraded')} {_pkg(pkg)}.")
 
     chaos_post_operation()
 
@@ -2400,7 +2573,7 @@ def list_installed(outdated: bool = False, json_output: bool = False):
         if json_output:
             print("[]")
         else:
-            print("No packages installed.")
+            print(f"  {_action('no packages installed')}")
         return
 
     if json_output:
@@ -2424,16 +2597,18 @@ def list_installed(outdated: bool = False, json_output: bool = False):
             else:
                 remote_ver = remote_info.get("version", "0.0.0")
             if _parse_ver(remote_ver) > _parse_ver(local_ver):
-                print(f"  {pkg} {Color.YELLOW}{local_ver}{Color.RESET} -> {Color.GREEN}{remote_ver}{Color.RESET}")
+                print(f"  {_pkg(pkg)} {_ver(local_ver)} -> {_ok(remote_ver)}")
                 found = True
         if not found:
-            print("Everything is up to date.")
+            print(f"  {_ok('Everything is up to date.')}")
         return
 
-    for pkg, info in db.items():
+    print()
+    for pkg, info in sorted(db.items()):
         ver = info.get("version", "0.0.0")
         fmt = info.get("format", "yapm")
-        print(f"{pkg} (v{ver}) [{fmt.upper()}]")
+        print(f"  {_pkg(pkg)}  {_ver(ver)}  {_fmt(fmt)}")
+    print(f"\n  {Color.DIM}{len(db)} package(s) installed{Color.RESET}\n")
 
 def uninstall_yapm():
     # require_root() has already run before this point
@@ -2500,17 +2675,19 @@ def info_package(pkg: str):
 
     pkg_key = pkg
 
-    print(f"Package: {pkg_key}")
+    print(f"\n  {_title(format_key(pkg_key))}")
 
     if pkg_key in db:
-        print(f"Status: Installed (v{db[pkg_key].get('version', '0.0.0')}) [Format: {db[pkg_key].get('format', 'yapm').upper()}]")
+        ver = db[pkg_key].get('version', '0.0.0')
+        fmt = db[pkg_key].get('format', 'yapm')
+        print(f"  {_action('status')} {_ok('Installed')} {_ver(f'v{ver}')} [{_fmt(fmt)}]")
         meta = db[pkg_key].get("metadata", {})
         if "description" in meta:
-            print(f"Description: {meta['description']}")
+            print(f"  {_action('description')} {meta['description']}")
         if "dependencies" in meta and meta["dependencies"]:
-            print(f"Dependencies: {', '.join(meta['dependencies'])}")
+            print(f"  {_action('depends on')} {', '.join(meta['dependencies'])}")
     else:
-        print("Status: Not installed")
+        print(f"  {_action('status')} Not installed")
 
     if pkg_key in idx.get("packages", {}):
         formats_entry = idx["packages"][pkg_key]
@@ -2518,19 +2695,21 @@ def info_package(pkg: str):
             entry = formats_entry.get(fmt_name)
             if not entry:
                 continue
-            print(f"[{fmt_name.upper()} format]")
+            print(f"\n  {_fmt(fmt_name)}")
             if "versions" in entry:
-                print(f"  Available versions: {', '.join(sorted(entry['versions'].keys()))}")
-                print(f"  Latest: {entry.get('latest', 'unknown')}")
+                vers = ', '.join(_ver(v) for v in sorted(entry['versions'].keys()))
+                print(f"  {_action('versions')} {vers}")
+                print(f"  {_action('latest')} {_ver(entry.get('latest', 'unknown'))}")
                 ver_info = entry["versions"].get(entry.get("latest", ""), {})
                 if "dependencies" in ver_info and ver_info["dependencies"]:
-                    print(f"  Dependencies: {', '.join(ver_info['dependencies'])}")
+                    print(f"  {_action('depends on')} {', '.join(ver_info['dependencies'])}")
             else:
-                print(f"  Remote Version: {entry.get('version', '0.0.0')}")
+                print(f"  {_action('version')} {_ver(entry.get('version', '0.0.0'))}")
                 if "dependencies" in entry and entry["dependencies"]:
-                    print(f"  Remote Dependencies: {', '.join(entry['dependencies'])}")
+                    print(f"  {_action('depends on')} {', '.join(entry['dependencies'])}")
     else:
-        print("Not found in remote index.")
+        print(f"  {_action('remote')} Not found in index.")
+    print()
 
 def search_package(term: str):
     idx = load_index()
@@ -2558,13 +2737,13 @@ def search_package(term: str):
                 installed_mark = ""
                 if pkg_key in db:
                     local_ver = db[pkg_key].get("version", "?")
-                    installed_mark = f" {Color.GREEN}[installed {local_ver}]{Color.RESET}"
-                print(f"{display} (v{latest_ver}) - {ver_info.get('description', 'No description')}{installed_mark}")
+                    installed_mark = f"  {_ok(f'[installed {local_ver}]')}"
+                print(f"  {_pkg(display)} {_ver(f'v{latest_ver}')} - {ver_info.get('description', 'No description')}{installed_mark}")
                 found = True
                 break
 
     if not found:
-        print("No matches found in local index. Try 'yapm update' first.")
+        print(f"  {_warn('No matches found in local index.')} Try 'yapm update' first.")
 
 # ============================================================
 # QOL COMMANDS
@@ -3497,13 +3676,17 @@ def _dispatch(args):
         ver = APP_VERSION
         if config_flag("yapm.riot"):
             ver = f"{APP_VERSION}-riot"
-        print(f"yapm version {ver}")
+        print(f"""
+{Color.YAPM_BROWN}  __ _____ ____  __ _{Color.RESET}
+{Color.YAPM_BROWN} / // / _ `/ _ \\/  ' \\{Color.RESET}
+{Color.YAPM_BROWN} \\_, /\\_,_/ .__/_/_/_/{Color.RESET}
+{Color.YAPM_BROWN}/___/    /_/{Color.RESET}          {Color.BOLD}v{ver}{Color.RESET}
+""")
+        print(f"  {_action('installed')} {Color.BOLD}yapm{_ver(f' v{ver}')}")
+        pkgs = load_db()
+        print(f"  {_action('packages')} {_pkg(str(len(pkgs)))} installed")
         if not config_flag("yapm.riot"):
-            print("riot features available via yapm.conf")
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE) as f:
-                cv = json.load(f).get("version", "unknown")
-            print(f"config version {cv}")
+            print(f"  {_action('hint')} riot features available via {Color.BOLD}yapm.conf{Color.RESET}")
     elif args.command == "fetch-count":
         fetch_count()
     elif args.command == "completions":
