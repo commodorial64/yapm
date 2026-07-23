@@ -174,7 +174,7 @@ def _check_cross_distro(fmt: str):
 DEFAULT_CONFIG = {
     "version": CURRENT_VERSION,
     "mirrors": [
-        {"url": "https://yapm.pages.dev/", "priority": 0}
+        {"url": "https://yapm.pages.dev/", "priority": 0},
         {"url": "https://mirror.rackspace.com/archlinux/", "priority": 10},
         {"url": "https://deb.debian.org/debian/", "priority": 20},
         {"url": "https://archive.ubuntu.com/ubuntu/", "priority": 30}
