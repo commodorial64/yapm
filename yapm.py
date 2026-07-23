@@ -1429,7 +1429,7 @@ def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
         install_file = Path(td) / ".INSTALL"
         if not install_file.exists():
             return
-        # NOTE: deliberately NOT under <root>/tmp. arch-chroot bind-mounts the
+        # NOTE: deliberately NOT under <root>/tmp — arch-chroot bind-mounts the
         # host's own /tmp over the chroot's /tmp, which silently shadows any
         # file we write there before the chroot even starts.
         hook_dir = root / "var" / "lib" / "yapm"
@@ -1540,6 +1540,8 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
                             lines = content.splitlines()
                             name, version, arch = "", "", _host_arch()
                             dependencies = []
+                            provides = []
+                            groups = []
                             for i, line in enumerate(lines):
                                 if line == "%NAME%": name = lines[i+1]
                                 elif line == "%VERSION%": version = lines[i+1]
@@ -1552,6 +1554,19 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
                                             dep = dep.split(char)[0]
                                         dependencies.append(dep)
                                         j += 1
+                                elif line == "%PROVIDES%":
+                                    j = i + 1
+                                    while j < len(lines) and lines[j] and not lines[j].startswith("%"):
+                                        prov = lines[j]
+                                        for char in ('<', '>', '='):
+                                            prov = prov.split(char)[0]
+                                        provides.append(prov)
+                                        j += 1
+                                elif line == "%GROUPS%":
+                                    j = i + 1
+                                    while j < len(lines) and lines[j] and not lines[j].startswith("%"):
+                                        groups.append(lines[j])
+                                        j += 1
 
                             if name:
                                 # Don't overwrite an entry already found in a higher-priority repo
@@ -1560,8 +1575,15 @@ def parse_arch_index(mirror_url: str, merged_index: dict):
                                     "mirror": mirror_url,
                                     "format": "arch",
                                     "dependencies": dependencies,
+                                    "provides": provides,
                                     "download_path": f"{repo}/os/{_host_arch()}/{name}-{version}-{arch}.pkg.tar.zst"
                                 })
+                                for prov in provides:
+                                    merged_index.setdefault("arch_provides", {}).setdefault(prov, name)
+                                for grp in groups:
+                                    merged_index.setdefault("arch_groups", {}).setdefault(grp, [])
+                                    if name not in merged_index["arch_groups"][grp]:
+                                        merged_index["arch_groups"][grp].append(name)
         except Exception as e:
             print(f"Error parsing Arch {repo} index: {e}")
 
@@ -1637,6 +1659,10 @@ def get_pkg_info(idx: dict, pkg: str, version: Optional[str] = None, arch_mode: 
     """
     packages = idx.get("packages", {})
     entry = packages.get(pkg)
+    if not entry and arch_mode:
+        provided_by = idx.get("arch_provides", {}).get(pkg)
+        if provided_by:
+            entry = packages.get(provided_by)
     if not entry:
         return None
 
@@ -2154,6 +2180,15 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
             pkg_name, pkg_source = pkg_spec.rsplit("@", 1)
         else:
             pkg_name = pkg_spec
+
+        if arch_mode and pkg_name not in idx.get("packages", {}) and pkg_name in idx.get("arch_groups", {}):
+            members = idx["arch_groups"][pkg_name]
+            print(f"  {_action('group')} {_pkg(pkg_name)} expands to: {', '.join(members)}")
+            for member in members:
+                pin_version[member] = None
+                pin_mirror[member] = global_pinned_mirror
+                resolve_dependencies(member, idx, db, to_install_merged, seen, visited, version=None, arch_mode=arch_mode)
+            continue
 
         pkg_pinned_mirror = global_pinned_mirror
         is_github = False
