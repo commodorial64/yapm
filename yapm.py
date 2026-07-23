@@ -1429,11 +1429,15 @@ def run_pkg_install_hook(pkg_data: bytes, root: Path, phase: str):
         install_file = Path(td) / ".INSTALL"
         if not install_file.exists():
             return
-        tmp_hook = root / "tmp" / "yapm_install_hook.sh"
-        tmp_hook.parent.mkdir(parents=True, exist_ok=True)
+        # NOTE: deliberately NOT under <root>/tmp. arch-chroot bind-mounts the
+        # host's own /tmp over the chroot's /tmp, which silently shadows any
+        # file we write there before the chroot even starts.
+        hook_dir = root / "var" / "lib" / "yapm"
+        tmp_hook = hook_dir / "_install_hook.sh"
+        hook_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(install_file, tmp_hook)
         os.chmod(tmp_hook, 0o755)
-        script = f"source /tmp/yapm_install_hook.sh && if type {phase} >/dev/null 2>&1; then {phase}; fi"
+        script = f"source /var/lib/yapm/_install_hook.sh && if type {phase} >/dev/null 2>&1; then {phase}; fi"
         print(f"  Running {phase} hook...")
         if str(root) != "/":
             if not shutil.which("arch-chroot"):
@@ -3524,6 +3528,13 @@ def main():
     m_remove.add_argument("url", metavar="URL", help="URL of the mirror to remove")
 
     mirror_sub.add_parser(
+        "reset",
+        help="Restore the default mirror list",
+        description="Discard all custom mirrors and restore yapm's built-in defaults.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    mirror_sub.add_parser(
         "sync",
         help="Test all mirrors and remove unreachable ones",
         description="Send a HEAD request to each mirror and remove any that fail to respond. "
@@ -3704,6 +3715,8 @@ def _dispatch(args):
             mirror_add(args.url, args.priority)
         elif args.mirror_cmd == "remove":
             mirror_remove(args.url)
+        elif args.mirror_cmd == "reset":
+            mirror_preset()
         elif args.mirror_cmd == "sync":
             mirror_refresh()
         elif args.mirror_cmd == "test":
