@@ -25,11 +25,18 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+SRC_DIR="$(dirname "$0")"
 INSTALL_BIN="/usr/local/bin/yapm"
-SRC_FILE="$(dirname "$0")/yapm.py"
+SRC_FILE="$SRC_DIR/yapm.py"
+SRC_CORE="$SRC_DIR/core"
 
 if [ ! -f "$SRC_FILE" ]; then
-    echo -e "${RED}Error: yapm.py not found in $(dirname "$0")${NC}"
+    echo -e "${RED}Error: yapm.py not found in $SRC_DIR${NC}"
+    exit 1
+fi
+
+if [ ! -d "$SRC_CORE" ]; then
+    echo -e "${RED}Error: core/ package not found in $SRC_DIR${NC}"
     exit 1
 fi
 
@@ -38,9 +45,19 @@ mkdir -p /etc/yapm
 mkdir -p /var/lib/yapm/packages
 mkdir -p /var/lib/yapm/cache
 
-# Copy and make executable
+# Copy yapm.py and the core/ package (remove stale core/ from old installs)
+rm -rf /usr/local/bin/core
 cp "$SRC_FILE" "$INSTALL_BIN"
+cp -r "$SRC_CORE" /usr/local/bin/core
 chmod +x "$INSTALL_BIN"
+
+# Sanity check: entry point must import
+if ! python3 -c "import sys; sys.path.insert(0, '/usr/local/bin'); import yapm" 2>/dev/null; then
+    echo -e "${RED}Error: installed yapm failed to import.${NC}"
+    rm -f "$INSTALL_BIN"
+    rm -rf /usr/local/bin/core
+    exit 1
+fi
 
 echo -e "${GREEN}Successfully installed yapm to $INSTALL_BIN${NC}"
 

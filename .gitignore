@@ -2,3 +2,5 @@
 .vscode/
 junk/
 pyproject.toml
+build.sh
+dist/
