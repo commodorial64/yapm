@@ -5,7 +5,7 @@ import shutil
 import sys
 from pathlib import Path
 
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.6.0"
 CURRENT_VERSION = 1  # Config version
 
 VIRTUAL_PROVIDERS = frozenset({"sh", "awk", "perl", "python", "ruby"})
