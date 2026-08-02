@@ -13,7 +13,7 @@ _yapm() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install remove list info search update upgrade fetch version uninstall riot build submit outdated files why clean repair mirror hall su fetch-count completions"
+    commands="install remove list info search update upgrade fetch version uninstall riot build submit outdated files why clean repair mirror hall su fetch-count completions config"
 
     if [[ ${cur} == -* ]]; then
         case "${COMP_WORDS[1]}" in
@@ -24,6 +24,7 @@ _yapm() {
             mirror)   COMPREPLY=( $(compgen -W "add list remove sync test show" -- ${cur}) ) ;;
             hall)     COMPREPLY=( $(compgen -W "add list remove show" -- ${cur}) ) ;;
             completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- ${cur}) ) ;;
+            config)   COMPREPLY=( $(compgen -W "list enable disable" -- ${cur}) ) ;;
             *)        COMPREPLY=( $(compgen -W "--help" -- ${cur}) ) ;;
         esac
         return 0
@@ -95,6 +96,7 @@ _yapm() {
         'su:Re-run a command with sudo'
         'fetch-count:Print package count for fetch tools'
         'completions:Generate shell completion scripts'
+        'config:View and toggle yapm configuration flags'
     )
 
     _arguments -C \
@@ -139,6 +141,9 @@ _yapm() {
                     ;;
                 completions)
                     _arguments '1:shell:(bash zsh fish)' && ret=0
+                    ;;
+                config)
+                    _arguments '1:subcommand:(list enable disable)' && ret=0
                     ;;
             esac
             ;;
@@ -205,6 +210,8 @@ complete -c yapm -n '__fish_use_subcommand' -a hall -d 'Manage mirror groups'
 complete -c yapm -n '__fish_use_subcommand' -a su -d 'Re-run with sudo'
 complete -c yapm -n '__fish_use_subcommand' -a fetch-count -d 'Package count for fetch tools'
 complete -c yapm -n '__fish_use_subcommand' -a completions -d 'Generate shell completions'
+complete -c yapm -n '__fish_use_subcommand' -a config -d 'View and toggle yapm configuration flags'
+complete -c yapm -n '__fish_seen_subcommand_from config' -a 'list enable disable'
 
 # install flags
 complete -c yapm -n '__fish_seen_subcommand_from install' -s m -l mirror -d 'Pin to mirror by index' -r

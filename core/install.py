@@ -305,9 +305,6 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         update_index(hall=hall)
 
     if root and root != "/":
-        if not config_flag("yapm.insroot"):
-            print("enable yapm.insroot to use this feature")
-            sys.exit(1)
         set_root_dir(root)
 
     db = load_db()
@@ -434,8 +431,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
             data = f.read()
         _install_single(pkg_name, db, data, local_fmt)
         if local_fmt == "arch":
-            if config_flag("yapm.hooks"):
-                run_pkg_install_hook(data, ROOT_DIR, "post_install")
+            run_pkg_install_hook(data, ROOT_DIR, "post_install")
             pkginfo = parse_pkginfo(data)
             if pkginfo:
                 db[pkg_name]["version"] = pkginfo.get("pkgver", "0.0.0")
@@ -546,7 +542,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
 
         _install_single(p, db, data, fetched_fmt)
         needs_ldconfig = True
-        if fetched_fmt == "arch" and config_flag("yapm.hooks"):
+        if fetched_fmt == "arch":
             run_pkg_install_hook(data, ROOT_DIR, "post_install")
         print(f"  {_action('installed')} {_pkg(chaos_wrong_name(p))}.")
 
@@ -770,11 +766,6 @@ def upgrade_packages(refresh: bool = False, dry_run: bool = False):
 
 def init_package(noconfirm: bool = False, root: Optional[str] = None):
     # bootstrap a Riot system by ensuring bash is installed
-    if not config_flag("yapm.riot"):
-        print("Error: yapm init requires yapm.riot to be enabled.")
-        print("  Run: yapm config enable yapm.riot")
-        sys.exit(1)
-
     db = load_db()
     if "bash" in db:
         print("bash is already installed.")

@@ -286,15 +286,20 @@ def main():
     p_repair.add_argument("package", metavar="PACKAGE",
                           help="Name of the installed package to repair")
 
-    # config (hidden)
-    p_config = sub.add_parser("config", help=argparse.SUPPRESS)
+    # config
+    p_config = sub.add_parser(
+        "config",
+        help="View and toggle yapm configuration flags",
+        description="List or toggle yapm configuration flags in ~/.config/yapm/yapm.conf.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     config_sub = p_config.add_subparsers(dest="config_cmd", required=True, metavar="<action>")
 
-    p_config_list = config_sub.add_parser("list", help=argparse.SUPPRESS)
-    p_config_enable = config_sub.add_parser("enable", help=argparse.SUPPRESS)
-    p_config_enable.add_argument("flag", metavar="FLAG", help=argparse.SUPPRESS)
-    p_config_disable = config_sub.add_parser("disable", help=argparse.SUPPRESS)
-    p_config_disable.add_argument("flag", metavar="FLAG", help=argparse.SUPPRESS)
+    p_config_list = config_sub.add_parser("list", help="List configuration flags and their state")
+    p_config_enable = config_sub.add_parser("enable", help="Turn a configuration flag on")
+    p_config_enable.add_argument("flag", metavar="FLAG", help="Name of the flag to enable")
+    p_config_disable = config_sub.add_parser("disable", help="Turn a configuration flag off")
+    p_config_disable.add_argument("flag", metavar="FLAG", help="Name of the flag to disable")
 
     # mirror
     p_mirror = sub.add_parser(
@@ -432,7 +437,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ("submit", "su", "completions", "fetch-count", "version", "setup", "list"):
+    if args.command not in ("submit", "su", "completions", "fetch-count", "version", "setup", "list", "config"):
         if args.command == "build" and getattr(args, "file", False):
             pass  # template generation doesn't need root
         else:
@@ -502,8 +507,6 @@ def _dispatch(args):
         print(f"  {_action('installed')} {Color.BOLD}yapm{_ver(f' v{ver}')}")
         pkgs = load_db()
         print(f"  {_action('packages')} {_pkg(str(len(pkgs)))} installed")
-        if not config_flag("yapm.riot"):
-            print(f"  {_action('hint')} riot features available via {Color.BOLD}yapm.conf{Color.RESET}")
     elif args.command == "fetch-count":
         fetch_count()
     elif args.command == "completions":
