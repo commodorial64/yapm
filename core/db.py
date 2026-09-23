@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Dict
 
-from .paths import DB_FILE
+from . import paths as paths
 
 # fcntl-based lock
 class _FileLock:
@@ -30,16 +30,16 @@ class _FileLock:
             self._fd.close()
 
 def _write_db(db: Dict):
-    with open(DB_FILE, "w") as f:
+    with open(paths.DB_FILE, "w") as f:
         json.dump(db, f, indent=4)
 
 def load_db() -> Dict:
     try:
-        DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not DB_FILE.exists():
-            DB_FILE.write_text("{}")
-        with _FileLock(DB_FILE):
-            with open(DB_FILE) as f:
+        paths.DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not paths.DB_FILE.exists():
+            paths.DB_FILE.write_text("{}")
+        with _FileLock(paths.DB_FILE):
+            with open(paths.DB_FILE) as f:
                 db = json.load(f)
             migrated = False
             new_db = {}
@@ -57,11 +57,11 @@ def load_db() -> Dict:
     except (OSError, PermissionError):
         # read-only fallback (e.g. neofetch counting)
         try:
-            with open(DB_FILE) as f:
+            with open(paths.DB_FILE) as f:
                 return json.load(f)
         except Exception:
             return {}
 
 def save_db(db: Dict):
-    with _FileLock(DB_FILE):
+    with _FileLock(paths.DB_FILE):
         _write_db(db)

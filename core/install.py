@@ -16,15 +16,24 @@ from .completions import _user_home
 from .config import config_flag, resolve_hall, sorted_mirrors
 from .db import load_db, save_db
 from .download import parse_pkginfo, parse_yapm_data, safe_extract
-from .extract import extract_arch, extract_deb, get_arch_file_list, get_deb_file_list, run_pkg_install_hook
+from .extract import extract_arch, extract_deb, get_arch_file_list, get_deb_file_list, is_protected_path, run_pkg_install_hook
 from .fetch import fetch_from_github, fetch_package, resolve_dependencies
 from .index import get_pkg_info, load_index, update_index
-from .paths import BIN_DIR, INSTALL_DIR, LIB_DIR, ROOT_DIR, VIRTUAL_PROVIDERS, set_root_dir
+from . import paths as paths
+from .paths import VIRTUAL_PROVIDERS, set_root_dir
 from .setup import SETUP_MARKER, setup
 from .utils import _parse_ver, format_key
 
 _DEB_DISTROS = {"debian", "ubuntu", "linuxmint", "pop", "kali", "raspbian", "deepin", "elementary", "zorin"}
 _ARCH_DISTROS = {"arch", "endeavouros", "manjaro", "garuda", "arco"}
+
+# bootstrap/core packages whose files overlap the live system. extracting
+# them onto "/" raw-clobbers system libs and account files. only allowed when
+# bootstrapping into a different root (--root) or with yapm.fuckaround.
+CORE_SYSTEM_PACKAGES = frozenset({
+    "filesystem", "glibc", "libgcc", "libstdc++",
+    "linux-api-headers", "tzdata", "iana-etc",
+})
 
 def _detect_host_distro() -> str:
     try:
@@ -61,14 +70,21 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
     _check_cross_distro(fmt)
 
-    # .yapm goes to sandbox (has manifests); arch/deb extract to ROOT_DIR
+    if (fmt in ("arch", "deb") and str(paths.ROOT_DIR) == "/"
+            and pkg_name in CORE_SYSTEM_PACKAGES and not config_flag("yapm.fuckaround")):
+        print(f"BLOCKED: {pkg_name} is a core/bootstrap package.")
+        print("Extracting it onto a live system overwrites system files (libs, /etc/passwd, /etc/group...).")
+        print("Use your native package manager, or bootstrap into a chroot with --root.")
+        sys.exit(1)
+
+    # .yapm goes to sandbox (has manifests); arch/deb extract to paths.ROOT_DIR
     use_root = fmt in ("arch", "deb")
     file_list: List[str] = []
 
     if use_root:
-        extract_target = ROOT_DIR
+        extract_target = paths.ROOT_DIR
     else:
-        extract_target = INSTALL_DIR / pkg_name
+        extract_target = paths.INSTALL_DIR / pkg_name
         if extract_target.exists():
             shutil.rmtree(extract_target)
         extract_target.mkdir(parents=True, exist_ok=True)
@@ -88,7 +104,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
         print(f"Installation failed: {e}")
         sys.exit(1)
 
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    paths.BIN_DIR.mkdir(parents=True, exist_ok=True)
     pkg_meta = {"version": "0.0.0", "dependencies": [], "format": fmt}
 
     if fmt == "yapm":
@@ -121,15 +137,18 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                 os.chmod(extract_target / pre_install, 0o755)
                 subprocess.run([str(extract_target / pre_install)], cwd=extract_target, check=True)
 
-            # FILES — map package paths to absolute ROOT_DIR destinations
+            # FILES — map package paths to absolute paths.ROOT_DIR destinations
             files_info = y_data.get("FILES", {})
             for src, dest in files_info.items():
                 src_path = extract_target / src
                 if dest.startswith("/"):
-                    dest_path = ROOT_DIR / dest.lstrip("/")
+                    dest_path = paths.ROOT_DIR / dest.lstrip("/")
                 else:
                     dest_path = extract_target / dest
                 if src_path.exists():
+                    if dest.startswith("/") and (dest_path.exists() or dest_path.is_symlink()) and is_protected_path(paths.ROOT_DIR, dest.lstrip("/")):
+                        print(f"  Preserving existing {dest_path} (skipped {src})")
+                        continue
                     print(f"  Mapping file: {src} -> {dest}")
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     if dest_path.exists() or dest_path.is_symlink():
@@ -139,11 +158,11 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
             run_file = content_info.get("RunFile")
             if run_file and (extract_target / run_file).exists():
-                dest = BIN_DIR / Path(run_file).name
+                dest = paths.BIN_DIR / Path(run_file).name
                 if dest.exists() or dest.is_symlink():
                     os.unlink(dest)
                 os.chmod(extract_target / run_file, 0o755)
-                symlink_src = ROOT_DIR / (extract_target / run_file).relative_to(ROOT_DIR)
+                symlink_src = paths.ROOT_DIR / (extract_target / run_file).relative_to(paths.ROOT_DIR)
                 os.symlink(symlink_src, dest)
                 print(f"  Linked executable {Path(run_file).name} -> {dest}")
                 chaos_yap_on_extract(run_file)
@@ -161,10 +180,10 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                 if src_dir.exists() and src_dir.is_dir():
                     for item in src_dir.iterdir():
                         if (item.is_file() or item.is_symlink()) and os.access(item, os.X_OK):
-                            dest = BIN_DIR / item.name
+                            dest = paths.BIN_DIR / item.name
                             if dest.exists() or dest.is_symlink():
                                 os.unlink(dest)
-                            symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                            symlink_src = paths.ROOT_DIR / item.relative_to(paths.ROOT_DIR)
                             os.symlink(symlink_src, dest)
                             print(f"  Linked {item.name} -> {dest}")
 
@@ -176,19 +195,24 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                 except Exception:
                     pass
     elif use_root:
-        # arch/deb extracted to ROOT_DIR — track installed files
+        # arch/deb extracted to paths.ROOT_DIR — track installed files
         if fmt == "arch":
             file_list = get_arch_file_list(data)
         else:
             file_list = get_deb_file_list(data)
 
-        # link executables from non-standard bin dirs to BIN_DIR
+        # don't track files we refuse to clobber (configs + arch metadata dotfiles)
+        file_list = [f for f in file_list
+                     if not f.lstrip("./").split("/", 1)[0].startswith(".")
+                     and not is_protected_path(paths.ROOT_DIR, f)]
+
+        # link executables from non-standard bin dirs to paths.BIN_DIR
         _standard_bin = {"/bin", "/usr/bin", "/sbin", "/usr/sbin"}
         for fpath in file_list:
-            full = ROOT_DIR / (fpath[2:] if fpath.startswith("./") else fpath)
+            full = paths.ROOT_DIR / (fpath[2:] if fpath.startswith("./") else fpath)
             parent = str(full.parent)
             if parent not in _standard_bin and full.exists() and (full.is_file() or full.is_symlink()) and os.access(full, os.X_OK):
-                dest = BIN_DIR / full.name
+                dest = paths.BIN_DIR / full.name
                 if dest.is_symlink() and not dest.exists():
                     dest.unlink(missing_ok=True)
                 if not dest.exists() and not dest.is_symlink():
@@ -227,7 +251,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                     pass
     else:
         # arch/deb in sandbox mode on the host — fallback linking
-        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        paths.BIN_DIR.mkdir(parents=True, exist_ok=True)
         LIB_DIR.mkdir(parents=True, exist_ok=True)
 
         ldso_conf = Path("/etc/ld.so.conf.d/yapm.conf")
@@ -244,10 +268,10 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
             if src_dir.exists() and src_dir.is_dir():
                 for item in src_dir.iterdir():
                     if (item.is_file() or item.is_symlink()) and os.access(item, os.X_OK):
-                        dest = BIN_DIR / item.name
+                        dest = paths.BIN_DIR / item.name
                         if dest.exists() or dest.is_symlink():
                             os.unlink(dest)
-                        symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                        symlink_src = paths.ROOT_DIR / item.relative_to(paths.ROOT_DIR)
                         os.symlink(symlink_src, dest)
                         print(f"  Linked {item.name} -> {dest}")
 
@@ -260,7 +284,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
                             dest = LIB_DIR / item.name
                             if dest.exists() or dest.is_symlink():
                                 os.unlink(dest)
-                            symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                            symlink_src = paths.ROOT_DIR / item.relative_to(paths.ROOT_DIR)
                             os.symlink(symlink_src, dest)
                             print(f"  Linked lib {item.name} -> {dest}")
 
@@ -298,7 +322,7 @@ def _install_single(pkg_name: str, db: Dict, data: bytes, fmt: str):
 
     save_db(db)
 
-def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False, dry_run: bool = False, hall: Optional[str] = None):
+def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] = None, root: Optional[str] = None, noconfirm: bool = False, dry_run: bool = False, hall: Optional[str] = None, skip_deps: bool = False):
     if config_flag("yapm.yapm"):
         chaos_spinner(3)
     if config_flag("yapm.autoupdate"):
@@ -353,7 +377,11 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
             for member in members:
                 pin_version[member] = None
                 pin_mirror[member] = global_pinned_mirror
-                resolve_dependencies(member, idx, db, to_install_merged, seen, visited, version=None, arch_mode=arch_mode)
+                if skip_deps:
+                    if member not in db and member not in to_install_merged:
+                        to_install_merged.append(member)
+                else:
+                    resolve_dependencies(member, idx, db, to_install_merged, seen, visited, version=None, arch_mode=arch_mode)
             continue
 
         pkg_pinned_mirror = global_pinned_mirror
@@ -413,7 +441,11 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
 
         pin_version[pkg_name] = pkg_version
         pin_mirror[pkg_name] = pkg_pinned_mirror
-        resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, visited, version=pkg_version, arch_mode=arch_mode)
+        if skip_deps:
+            if pkg_name not in db and pkg_name not in to_install_merged:
+                to_install_merged.append(pkg_name)
+        else:
+            resolve_dependencies(pkg_name, idx, db, to_install_merged, seen, visited, version=pkg_version, arch_mode=arch_mode)
 
     for pkg_path in local_installs:
         local_fmt = fmt
@@ -431,7 +463,7 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
             data = f.read()
         _install_single(pkg_name, db, data, local_fmt)
         if local_fmt == "arch":
-            run_pkg_install_hook(data, ROOT_DIR, "post_install")
+            run_pkg_install_hook(data, paths.ROOT_DIR, "post_install")
             pkginfo = parse_pkginfo(data)
             if pkginfo:
                 db[pkg_name]["version"] = pkginfo.get("pkgver", "0.0.0")
@@ -493,6 +525,13 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         else:
             fetched_fmt = (get_pkg_info(idx, p, p_ver) or {}).get("format", "yapm")
 
+        if (p in CORE_SYSTEM_PACKAGES and fetched_fmt in ("arch", "deb") and str(paths.ROOT_DIR) == "/"
+                and not config_flag("yapm.fuckaround")):
+            print(f"BLOCKED: {p} is a core/bootstrap package.")
+            print("Extracting it onto a live system overwrites system files (libs, /etc/passwd, /etc/group...).")
+            print("Use your native package manager, or bootstrap into a chroot with --root.")
+            sys.exit(1)
+
         if fetched_fmt == "nix":
             nix_info = (get_pkg_info(idx, p, p_ver) or {})
             attr_name = nix_info.get("attr", p)
@@ -543,12 +582,12 @@ def install_package(packages: List[str], fmt: str, mirror_index: Optional[int] =
         _install_single(p, db, data, fetched_fmt)
         needs_ldconfig = True
         if fetched_fmt == "arch":
-            run_pkg_install_hook(data, ROOT_DIR, "post_install")
+            run_pkg_install_hook(data, paths.ROOT_DIR, "post_install")
         print(f"  {_action('installed')} {_pkg(chaos_wrong_name(p))}.")
 
-    if "linux" in to_install_merged and str(ROOT_DIR) != "/":
+    if "linux" in to_install_merged and str(paths.ROOT_DIR) != "/":
         print("Running mkinitcpio for bootstrapped system...")
-        subprocess.run(["arch-chroot", str(ROOT_DIR), "mkinitcpio", "-P"], check=False)
+        subprocess.run(["arch-chroot", str(paths.ROOT_DIR), "mkinitcpio", "-P"], check=False)
 
     if needs_ldconfig:
         print(f"  {_action('updating library cache')}...")
@@ -586,6 +625,11 @@ def remove_package(pkg: str, noconfirm: bool = False):
 
     pkg_info = db[pkg_key]
     fmt = pkg_info.get("format", "yapm")
+
+    if (pkg_key in CORE_SYSTEM_PACKAGES and fmt in ("arch", "deb")
+            and str(paths.ROOT_DIR) == "/" and not config_flag("yapm.fuckaround")):
+        print(f"  {_err(f'blocked')} {_pkg(format_key(pkg_key))} is a core/bootstrap package — manage it with your native package manager. Aborting.")
+        return
 
     # run uninstall script before removing files (native packages only)
     if fmt == "yapm":
@@ -625,11 +669,13 @@ def remove_package(pkg: str, noconfirm: bool = False):
     file_list = pkg_info.get("files", [])
 
     if file_list:
-        # file-list removal (packages extracted to ROOT_DIR)
+        # file-list removal (packages extracted to paths.ROOT_DIR)
         root_ref = Path(pkg_info.get("path", "/"))
         removed = 0
         for f in file_list:
             full_path = root_ref / f
+            if is_protected_path(root_ref, f):
+                continue
             if full_path.is_symlink() or full_path.is_file():
                 os.unlink(full_path)
                 removed += 1
@@ -652,10 +698,10 @@ def remove_package(pkg: str, noconfirm: bool = False):
             except OSError:
                 pass
         print(f"  {_action('removed')} {_pkg(format_key(pkg_key))} ({removed} files).")
-        # clean up BIN_DIR symlinks pointing into this package's tree
+        # clean up paths.BIN_DIR symlinks pointing into this package's tree
         pkg_path = pkg_info.get("path", "")
         if pkg_path and pkg_path != "/":
-            for link in BIN_DIR.iterdir():
+            for link in paths.BIN_DIR.iterdir():
                 if link.is_symlink():
                     try:
                         target = str(link.resolve())
@@ -665,7 +711,7 @@ def remove_package(pkg: str, noconfirm: bool = False):
                         pass
         else:
             # for root-extracted packages, check against file_list
-            for link in BIN_DIR.iterdir():
+            for link in paths.BIN_DIR.iterdir():
                 if link.is_symlink():
                     try:
                         target = str(link.resolve())
@@ -680,7 +726,7 @@ def remove_package(pkg: str, noconfirm: bool = False):
         for src_dir in bin_source_dirs:
             if src_dir.exists() and src_dir.is_dir():
                 for item in src_dir.iterdir():
-                    dest = BIN_DIR / item.name
+                    dest = paths.BIN_DIR / item.name
                     if dest.is_symlink() and str(dest.resolve()) == str(item.resolve()):
                         os.unlink(dest)
                         print(f"  {_action('removed')} symlink {dest.name}")
@@ -758,6 +804,10 @@ def upgrade_packages(refresh: bool = False, dry_run: bool = False):
         data = fetch_package(pkg, version=ver)
         if not data:
             print(f"    {_err('failed to fetch')} {_pkg(pkg)}. Skipping.")
+            continue
+        if (pkg in CORE_SYSTEM_PACKAGES and installed_fmt in ("arch", "deb")
+                and str(paths.ROOT_DIR) == "/" and not config_flag("yapm.fuckaround")):
+            print(f"    {_err(f'blocked')} {_pkg(pkg)} is a core/bootstrap package — manage it with your native package manager. Skipping.")
             continue
         _install_single(pkg, db, data, installed_fmt)
         print(f"  {_action('upgraded')} {_pkg(pkg)}.")

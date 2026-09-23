@@ -8,7 +8,8 @@ from pathlib import Path
 from .color import Color, _action, _err, _fmt, _ok, _pkg, _title, _ver, _warn
 from .db import load_db
 from .index import load_index
-from .paths import BIN_DIR, CACHE_DIR, ROOT_DIR
+from . import paths as paths
+from .paths import CACHE_DIR
 from .utils import _parse_ver, format_key
 
 def fetch_count():
@@ -229,15 +230,15 @@ def repair_package(pkg: str):
         print(f"Error: package directory {target} does not exist.")
         sys.exit(1)
 
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    paths.BIN_DIR.mkdir(parents=True, exist_ok=True)
     fixed = 0
     bin_source_dirs = [target / "src", target / "usr" / "bin", target / "bin"]
     for src_dir in bin_source_dirs:
         if src_dir.exists() and src_dir.is_dir():
             for item in src_dir.iterdir():
                 if item.is_file() and os.access(item, os.X_OK):
-                    dest = BIN_DIR / item.name
-                    symlink_src = ROOT_DIR / item.relative_to(ROOT_DIR)
+                    dest = paths.BIN_DIR / item.name
+                    symlink_src = paths.ROOT_DIR / item.relative_to(paths.ROOT_DIR)
                     if not dest.exists():
                         os.symlink(symlink_src, dest)
                         print(f"  Created symlink {item.name} -> {dest}")

@@ -1,4 +1,5 @@
 # pkg extract engines
+import copy
 import os
 import shutil
 import subprocess
@@ -6,6 +7,116 @@ import tarfile
 import tempfile
 from pathlib import Path
 from typing import List
+
+# system files that must never be clobbered on a live host.
+# mirrors pacman's NoUpgrade / protected-file semantics: if the destination
+# already exists, the packaged version is written alongside as <name>.pacnew.
+# (In a fresh chroot these don't exist yet, so bootstrapping still works.)
+PROTECTED_FILES = frozenset({
+    "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow",
+    "/etc/sudoers", "/etc/sudoers.d", "/etc/fstab", "/etc/crypttab",
+    "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
+    "/etc/hostname", "/etc/os-release", "/etc/localtime", "/etc/shells",
+    "/etc/subuid", "/etc/subgid", "/etc/machine-id", "/etc/mtab",
+    "/etc/issue", "/etc/host.conf", "/etc/ld.so.conf",
+    "/etc/profile", "/etc/profile.d", "/etc/skel",
+})
+
+_ARCH_META = {".PKGINFO", ".INSTALL", ".BUILDINFO", ".MTREE"}
+
+def _protected_rel(rel: str) -> bool:
+    parts = rel.split("/")
+    for i in range(1, len(parts) + 1):
+        if "/" + "/".join(parts[:i]) in PROTECTED_FILES:
+            return True
+    return False
+
+def is_protected_path(root: Path, rel: str) -> bool:
+    return _protected_rel(rel.lstrip("./"))
+
+def _yapm_filter(member: tarfile.TarInfo, path: str) -> tarfile.TarInfo:
+    arcname = member.name.replace(os.sep, "/")
+    if arcname.startswith("/") or arcname.split("/", 1)[0] == "..":
+        raise tarfile.FilterError(f"unsafe path: {member.name}")
+    if member.isdev() or member.isfifo():
+        raise tarfile.FilterError(f"device/pipe: {member.name}")
+    if member.islnk():
+        link = member.linkname.replace(os.sep, "/")
+        if link.startswith("/") or link.split("/", 1)[0] == "..":
+            raise tarfile.FilterError(f"unsafe hardlink: {member.linkname}")
+    return member
+
+def _extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, target: Path):
+    try:
+        tar.extract(member, target, filter=_yapm_filter)
+    except TypeError:
+        # python < 3.11.4: no filter kwarg (also: no default data filter) —
+        # the manual checks in _extract_tar_members still apply
+        tar.extract(member, target)
+    except (tarfile.FilterError, OSError):
+        print(f"  Skipping unsafe/unsupported entry: {member.name}")
+
+def _extract_tar_members(tar: tarfile.TarFile, target: Path):
+    resolved_target = target.resolve()
+    for member in tar.getmembers():
+        name = member.name.strip()
+        if not name or name == ".":
+            continue
+        if name in _ARCH_META:
+            continue
+        # reject absolute or parent-traversing member names outright
+        if name.startswith("/"):
+            print(f"  Skipping absolute path in archive: {name}")
+            continue
+        rel = name[2:] if name.startswith("./") else name
+        if rel.startswith("/") or rel.split("/", 1)[0] == "..":
+            print(f"  Skipping unsafe path in archive: {name}")
+            continue
+        if member.isdev() or member.isfifo():
+            print(f"  Skipping device/pipe entry: {name}")
+            continue
+        # hardlinks resolve through the archive — a link target outside the
+        # extracted tree would read an arbitrary host file
+        if member.islnk():
+            link = member.linkname.replace(os.sep, "/")
+            if link.startswith("/") or link.split("/", 1)[0] == "..":
+                print(f"  Skipping unsafe hardlink: {name} -> {member.linkname}")
+                continue
+
+        dest = (resolved_target / rel).resolve()
+        try:
+            dest.relative_to(resolved_target)
+        except ValueError:
+            # catches write-through-symlink attacks: once an earlier member
+            # created a link pointing outside, resolving through it escapes
+            print(f"  Skipping unsafe path in archive: {name}")
+            continue
+
+        exists = dest.exists() or dest.is_symlink()
+        if exists and _protected_rel(rel):
+            if member.isdir():
+                continue
+            print(f"  Preserving existing {rel} — wrote {rel}.pacnew")
+            member = copy.copy(member)
+            member.name = f"{rel}.pacnew"
+            _extract_member(tar, member, resolved_target)
+            continue
+
+        _extract_member(tar, member, resolved_target)
+
+def _extract_tar_auto(tar_file: Path, target: Path):
+    try:
+        with tarfile.open(tar_file, mode="r:*") as tar:
+            _extract_tar_members(tar, target)
+        return
+    except (tarfile.ReadError, OSError):
+        pass
+    # zstd (and other unsupported compressions) — decompress to plain tar first
+    plain = tar_file.with_name(tar_file.name + ".plain")
+    subprocess.run(["zstd", "-d", "-f", str(tar_file), "-o", str(plain)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with tarfile.open(plain) as tar:
+        _extract_tar_members(tar, target)
 
 def extract_deb(data: bytes, target: Path):
     with tempfile.TemporaryDirectory() as td:
@@ -18,7 +129,7 @@ def extract_deb(data: bytes, target: Path):
             for f in Path(td).iterdir():
                 if f.name.startswith("data.tar"):
                     print("  Extracting DEB data payload...")
-                    subprocess.run(["tar", "-xf", f.name, "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    _extract_tar_auto(f, target)
                     break
         except subprocess.CalledProcessError as e:
             print(f"Error extracting DEB package: {e}\nStderr: {e.stderr}")
@@ -32,9 +143,13 @@ def extract_arch(data: bytes, target: Path):
         arch_path = Path(td) / "pkg.tar.zst"
         with open(arch_path, "wb") as f:
             f.write(data)
+        tar_path = Path(td) / "pkg.tar"
         try:
             print("  Extracting Arch ZSTD container...")
-            subprocess.run(["tar", "--use-compress-program=zstd", "-xf", "pkg.tar.zst", "-C", str(target)], cwd=td, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["zstd", "-d", "-f", str(arch_path), "-o", str(tar_path)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with tarfile.open(tar_path) as tar:
+                _extract_tar_members(tar, target)
         except subprocess.CalledProcessError as e:
             print(f"Error extracting Arch package: {e}\nStderr: {e.stderr}")
             raise

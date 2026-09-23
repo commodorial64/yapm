@@ -60,6 +60,8 @@ def main():
                            help="Show what would be installed without making changes")
     p_install.add_argument("-H", "--hall", type=str, default=None, metavar="NAME",
                            help="Only use mirrors from the named hall (see 'yapm hall add')")
+    p_install.add_argument("-S", "--skip-deps", action="store_true",
+                           help="Install the named packages without resolving dependencies")
 
     # remove
     p_remove = sub.add_parser(
@@ -462,7 +464,7 @@ def main():
 
 def _dispatch(args):
     if args.command == "install":
-        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm, dry_run=args.dry_run, hall=args.hall)
+        install_package(args.package, args.format, mirror_index=args.mirror, root=args.root, noconfirm=args.noconfirm, dry_run=args.dry_run, hall=args.hall, skip_deps=args.skip_deps)
     elif args.command == "remove":
         remove_package(args.package, noconfirm=args.noconfirm)
     elif args.command == "list":

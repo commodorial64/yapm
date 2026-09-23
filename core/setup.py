@@ -8,7 +8,8 @@ from pathlib import Path
 from .completions import _detect_shell, _detect_user, _install_completions_bash, _install_completions_fish, _install_completions_zsh, _install_fetch_count, _user_home
 from .config import save_config
 from .db import save_db
-from .paths import BIN_DIR, CACHE_DIR, CONFIG_DIR, CONFIG_FILE, CURRENT_VERSION, DATA_DIR, DB_FILE, DEFAULT_CONFIG, INSTALL_DIR, LOCK_FILE, _yapm_entry
+from . import paths as paths
+from .paths import CACHE_DIR, CONFIG_DIR, CONFIG_FILE, CURRENT_VERSION, DATA_DIR, DEFAULT_CONFIG, LOCK_FILE, _yapm_entry
 
 SETUP_MARKER = DATA_DIR / ".setup_done"
 
@@ -26,10 +27,10 @@ def ensure_dirs():
     check_deps()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    paths.INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    paths.BIN_DIR.mkdir(parents=True, exist_ok=True)
+    paths.DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     # check for another running yapm instance
@@ -55,7 +56,7 @@ def ensure_dirs():
                 config["mirrors"] = DEFAULT_CONFIG["mirrors"]
             save_config(config)
 
-    if not DB_FILE.exists():
+    if not paths.DB_FILE.exists():
         save_db({})
 
 def setup():
@@ -89,8 +90,8 @@ def setup():
 
     # make installed.json world-readable so neofetch/fastfetch can count packages
     try:
-        DB_FILE.chmod(0o644)
-        DB_FILE.parent.chmod(0o755)
+        paths.DB_FILE.chmod(0o644)
+        paths.DB_FILE.parent.chmod(0o755)
     except (OSError, PermissionError):
         pass
 
